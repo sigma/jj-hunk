@@ -1,4 +1,5 @@
 use crate::diff::{apply_selected_hunks, get_hunks, Hunk, HunkSelection};
+use crate::hunkset::{self, EnrichedHunk};
 use crate::spec::{Action, DefaultAction, FileSpec, Spec};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -198,9 +199,15 @@ where
     T: Into<ListOptions>,
 {
     let options = options.into();
-    let spec = resolve_optional_spec(options.spec.as_deref(), options.spec_file.as_deref())?
-        .map(|content| Spec::from_str(&content))
-        .transpose()?;
+    let resolved_spec_input = resolve_optional_spec(options.spec.as_deref(), options.spec_file.as_deref())?;
+    let spec = match &resolved_spec_input {
+        Some(content) if hunkset::is_hunkset(content) => {
+            let json = evaluate_hunkset(content, options.rev.as_deref())?;
+            Some(Spec::from_str(&json)?)
+        }
+        Some(content) => Some(Spec::from_str(content)?),
+        None => None,
+    };
 
     let include = normalize_patterns(&options.include);
     let exclude = normalize_patterns(&options.exclude);
@@ -369,6 +376,69 @@ fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<
     }
 
     Ok(Some(resolve_spec_input(spec, spec_file)?))
+}
+
+/// Evaluate a hunkset expression against the current diff state for a given
+/// revision, returning a JSON-serialized Spec.
+fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
+    let ast = hunkset::parse(hunkset_expr)
+        .map_err(|e| anyhow::anyhow!("failed to parse hunkset: {}", e))?;
+
+    let summary_entries = read_diff_summary(rev)?;
+    let (before_rev, after_rev) = resolve_revisions(rev);
+
+    // Collect all hunks with file context
+    let mut file_hunks: Vec<(String, String, Vec<Hunk>)> = Vec::new();
+
+    for entry in &summary_entries {
+        let path = primary_path(entry);
+        if path.is_empty() {
+            continue;
+        }
+
+        let file_paths = file_paths_for_entry(entry, &path);
+        let before_bytes = file_paths
+            .before
+            .as_deref()
+            .map(|p| read_jj_file(before_rev.as_deref(), p))
+            .unwrap_or_default();
+        let after_bytes = file_paths
+            .after
+            .as_deref()
+            .map(|p| read_jj_file(after_rev.as_deref(), p))
+            .unwrap_or_default();
+
+        if is_binary_data(&before_bytes) || is_binary_data(&after_bytes) {
+            continue;
+        }
+
+        let before_text = String::from_utf8_lossy(&before_bytes);
+        let after_text = String::from_utf8_lossy(&after_bytes);
+        let hunks = get_hunks(&before_text, &after_text);
+
+        if !hunks.is_empty() {
+            file_hunks.push((path, entry.status.clone(), hunks));
+        }
+    }
+
+    // Build enriched hunks
+    let enriched: Vec<EnrichedHunk> = file_hunks
+        .iter()
+        .flat_map(|(path, status, hunks)| {
+            hunks.iter().map(move |hunk| EnrichedHunk {
+                file_path: path,
+                file_status: status,
+                hunk,
+                enclosing_function: None,
+                enclosing_scope: None,
+            })
+        })
+        .collect();
+
+    let selected = hunkset::evaluate(&ast, &enriched);
+    let spec = hunkset::to_spec(&selected, &enriched);
+
+    serde_json::to_string(&spec).context("failed to serialize hunkset result as spec")
 }
 
 fn resolve_revisions(revset: Option<&str>) -> (Option<String>, Option<String>) {
@@ -1077,8 +1147,18 @@ fn resolve_spec_input(spec: Option<&str>, spec_file: Option<&str>) -> Result<Str
     Ok(spec.to_string())
 }
 
-fn run_jj_with_selection(args: &[&str], spec: Option<&str>, spec_file: Option<&str>) -> Result<()> {
+fn run_jj_with_selection(
+    args: &[&str],
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+    rev: Option<&str>,
+) -> Result<()> {
     let spec_content = resolve_spec_input(spec, spec_file)?;
+    let spec_content = if hunkset::is_hunkset(&spec_content) {
+        evaluate_hunkset(&spec_content, rev)?
+    } else {
+        spec_content
+    };
     let temp_file = std::env::temp_dir().join(format!("jj-hunk-{}.spec", std::process::id()));
     fs::write(&temp_file, spec_content)?;
 
@@ -1145,7 +1225,7 @@ pub fn split(
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file)
+    run_jj_with_selection(&args, spec, spec_file, rev)
 }
 
 pub fn commit(spec: Option<&str>, spec_file: Option<&str>, message: &str) -> Result<()> {
@@ -1153,6 +1233,7 @@ pub fn commit(spec: Option<&str>, spec_file: Option<&str>, message: &str) -> Res
         &["commit", "-i", JJ_HUNK_TOOL_ARG, "-m", message],
         spec,
         spec_file,
+        None, // commit always operates on @
     )
 }
 
@@ -1162,5 +1243,5 @@ pub fn squash(spec: Option<&str>, spec_file: Option<&str>, rev: Option<&str>) ->
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file)
+    run_jj_with_selection(&args, spec, spec_file, rev)
 }

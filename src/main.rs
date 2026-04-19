@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 mod diff;
+mod hunkset;
 mod spec;
 mod commands;
 
