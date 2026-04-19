@@ -254,11 +254,12 @@ impl Parser {
         }
     }
 
+    /// Negation is right-recursive: `~~x` is `~(~x)` (double negation).
     fn parse_negation(&mut self) -> Result<Expr, HunksetError> {
         if self.peek() == Some(&TokenKind::Tilde) {
             self.next_kind();
-            let atom = self.parse_atom()?;
-            Ok(Expr::Negation(Box::new(atom)))
+            let inner = self.parse_negation()?;
+            Ok(Expr::Negation(Box::new(inner)))
         } else {
             self.parse_atom()
         }
@@ -573,6 +574,14 @@ mod tests {
                 assert_eq!(args.len(), 2);
             }
             other => panic!("expected function, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_double_negation() {
+        match parse("~~type(delete)").unwrap() {
+            Expr::Negation(inner) => assert!(matches!(*inner, Expr::Negation(_))),
+            other => panic!("expected double negation, got {:?}", other),
         }
     }
 

@@ -79,7 +79,6 @@ List options:
 - `--include <glob>` / `--exclude <glob>` — filter paths (repeatable, supports `**`, `*`, `?`)
 - `--group none|directory|extension|status` — group output
 - `--binary skip|mark|include` — binary handling (default: mark)
-- `--max-bytes <n>` / `--max-lines <n>` — truncate before diffing
 - `--spec <hunkset|json|yaml>` / `--spec-file <path>` — filter output with a hunkset expression or JSON/YAML spec
 - `--files` — list files with hunk counts only
 - `--spec-template` — emit a spec template (JSON/YAML only)

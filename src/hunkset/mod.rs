@@ -36,6 +36,11 @@ pub fn is_hunkset(input: &str) -> bool {
     if first == b'{' || first == b'[' {
         return false;
     }
+    // Require at least one `(` to avoid false positives on bare YAML values
+    // like `all`, `none`, `reset`, etc.
+    if !trimmed.contains('(') {
+        return false;
+    }
     parse(trimmed).is_ok()
 }
 

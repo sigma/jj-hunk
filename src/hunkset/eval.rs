@@ -45,6 +45,21 @@ pub fn evaluate(expr: &Expr, hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, H
     }
 }
 
+/// Compile patterns, forcing exact match for enum-like values (type, status, extension).
+fn compile_exact(args: &[Arg]) -> Result<Vec<CompiledPattern>, HunksetError> {
+    let patterns: Vec<StringPattern> = extract_patterns(args)
+        .into_iter()
+        .map(|p| {
+            if p.kind == PatternKind::Substring {
+                StringPattern { kind: PatternKind::Exact, value: p.value }
+            } else {
+                p
+            }
+        })
+        .collect();
+    compile_patterns(patterns)
+}
+
 fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, HunksetError> {
     // Pre-compile patterns (validates regex upfront)
     let compiled = compile_patterns(extract_patterns(args))?;
@@ -52,9 +67,9 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
     match name.as_ref() {
         "file" => Ok(eval_file(args, hunks)),
         "glob" => Ok(eval_glob(args, hunks)),
-        "extension" => Ok(eval_extension(&compiled, hunks)),
-        "status" => Ok(eval_status(&compiled, hunks)),
-        "type" => Ok(eval_type(&compiled, hunks)),
+        "extension" => { let exact = compile_exact(args)?; Ok(eval_extension(&exact, hunks)) }
+        "status" => { let exact = compile_exact(args)?; Ok(eval_status(&exact, hunks)) }
+        "type" => { let exact = compile_exact(args)?; Ok(eval_type(&exact, hunks)) }
         "lines" => Ok(eval_lines(args, hunks, LineRangeMode::Either)),
         "before_line" => Ok(eval_lines(args, hunks, LineRangeMode::Before)),
         "after_line" => Ok(eval_lines(args, hunks, LineRangeMode::After)),
@@ -114,14 +129,8 @@ fn extract_ranges(args: &[Arg]) -> Vec<(usize, usize)> {
 /// file() defaults to exact matching for paths (not substring).
 /// Users can explicitly use `glob:` or `substring:` prefixes.
 fn eval_file(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let patterns: Vec<CompiledPattern> = extract_patterns(args)
-        .into_iter()
-        .map(|p| {
-            let kind = if p.kind == PatternKind::Substring { PatternKind::Exact } else { p.kind };
-            // unwrap is safe: if it were a regex, it was already validated in evaluate_function
-            CompiledPattern::compile(&StringPattern { kind, value: p.value }).unwrap()
-        })
-        .collect();
+    // unwrap: regex patterns were already validated in evaluate_function
+    let patterns = compile_exact(args).unwrap();
     hunks
         .iter()
         .enumerate()
@@ -335,7 +344,7 @@ pub fn to_spec(selected: &HashSet<usize>, hunks: &[EnrichedHunk]) -> Spec {
     let mut files: HashMap<String, Vec<String>> = HashMap::new();
 
     for &idx in selected {
-        let h = &hunks[idx];
+        let Some(h) = hunks.get(idx) else { continue };
         files
             .entry(h.file_path.to_string())
             .or_default()

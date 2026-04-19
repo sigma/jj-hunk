@@ -132,8 +132,6 @@ struct FileEntry {
     hunks: Vec<Hunk>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binary: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    truncated: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -165,8 +163,6 @@ struct FileSummary {
     hunk_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     binary: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    truncated: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,19 +207,16 @@ where
     let include = normalize_patterns(&options.include);
     let exclude = normalize_patterns(&options.exclude);
 
-    let all_file_hunks = load_file_hunks(options.rev.as_deref())?;
+    let all_file_hunks = load_file_hunks(options.rev.as_deref(), options.binary)?;
 
     let mut files = Vec::new();
 
     for fh in all_file_hunks {
-        if !include.is_empty() && !matches_any(&include, &fh.path) {
+        let paths_to_check = fh.all_paths();
+        if !include.is_empty() && !paths_to_check.iter().any(|p| matches_any(&include, p)) {
             continue;
         }
-        if !exclude.is_empty() && matches_any(&exclude, &fh.path) {
-            continue;
-        }
-
-        if fh.is_binary && options.binary == BinaryMode::Skip {
+        if !exclude.is_empty() && paths_to_check.iter().any(|p| matches_any(&exclude, p)) {
             continue;
         }
 
@@ -248,7 +241,6 @@ where
             rename: fh.rename,
             hunks,
             binary: if fh.is_binary { Some(true) } else { None },
-            truncated: None,
         });
     }
 
@@ -406,7 +398,7 @@ fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
     let ast = hunkset::parse(hunkset_expr)
         .map_err(|e| anyhow::anyhow!("failed to parse hunkset:\n{}", e.display_with_context()))?;
 
-    let file_hunks = load_file_hunks(rev)?;
+    let file_hunks = load_file_hunks(rev, BinaryMode::Skip)?;
 
     let enriched: Vec<EnrichedHunk> = file_hunks
         .iter()
@@ -435,9 +427,22 @@ struct FileHunks {
     is_binary: bool,
 }
 
+impl FileHunks {
+    /// All paths associated with this file entry (primary + rename source).
+    fn all_paths(&self) -> Vec<&str> {
+        let mut paths = vec![self.path.as_str()];
+        if let Some(rename) = &self.rename {
+            if rename.from != self.path {
+                paths.push(&rename.from);
+            }
+        }
+        paths
+    }
+}
+
 /// Load all file hunks for a revision, applying semantic enrichment.
 /// This is the shared core used by both `list` and `evaluate_hunkset`.
-fn load_file_hunks(rev: Option<&str>) -> Result<Vec<FileHunks>> {
+fn load_file_hunks(rev: Option<&str>, binary: BinaryMode) -> Result<Vec<FileHunks>> {
     let summary_entries = read_diff_summary(rev)?;
     let (before_rev, after_rev) = resolve_revisions(rev);
     let mut result = Vec::new();
@@ -461,8 +466,12 @@ fn load_file_hunks(rev: Option<&str>) -> Result<Vec<FileHunks>> {
             .unwrap_or_default();
 
         let is_binary = is_binary_data(&before_bytes) || is_binary_data(&after_bytes);
+        if is_binary && binary == BinaryMode::Skip {
+            continue;
+        }
 
-        let (before_text, after_text) = if !is_binary {
+        let should_diff = !is_binary || binary == BinaryMode::Include;
+        let (before_text, after_text) = if should_diff {
             (
                 String::from_utf8_lossy(&before_bytes).into_owned(),
                 String::from_utf8_lossy(&after_bytes).into_owned(),
@@ -471,7 +480,7 @@ fn load_file_hunks(rev: Option<&str>) -> Result<Vec<FileHunks>> {
             (String::new(), String::new())
         };
 
-        let mut hunks = if !is_binary {
+        let mut hunks = if should_diff {
             get_hunks(&before_text, &after_text)
         } else {
             Vec::new()
@@ -701,7 +710,6 @@ fn build_summary_output(files: Vec<FileEntry>, grouping: ListGrouping) -> ListSu
             rename: file.rename,
             hunk_count: file.hunks.len(),
             binary: file.binary,
-            truncated: file.truncated,
         })
         .collect();
 
@@ -897,9 +905,6 @@ fn format_summary_text(lines: &mut Vec<String>, files: &[FileSummary]) {
         if file.binary == Some(true) {
             line.push_str(" [binary]");
         }
-        if file.truncated == Some(true) {
-            line.push_str(" [truncated]");
-        }
         lines.push(line);
     }
 }
@@ -911,9 +916,6 @@ fn format_file_header(file: &FileEntry) -> String {
     }
     if file.binary == Some(true) {
         header.push_str(" [binary]");
-    }
-    if file.truncated == Some(true) {
-        header.push_str(" [truncated]");
     }
     header
 }
