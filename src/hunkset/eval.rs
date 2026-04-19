@@ -244,15 +244,25 @@ fn eval_content(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], mode: Cont
 
 // --- stable ID ---
 
+/// Match by hunk ID, supporting prefix matching for abbreviated IDs
+/// (e.g., `id("hunk-162b7798da21...")` matches the full ID).
 fn eval_id(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let ids: HashSet<String> = patterns
+    let ids: Vec<String> = patterns
         .iter()
         .filter_map(|p| crate::diff::normalize_hunk_id(p.value()))
         .collect();
     hunks
         .iter()
         .enumerate()
-        .filter(|(_, h)| ids.contains(&h.hunk.id))
+        .filter(|(_, h)| {
+            ids.iter().any(|id| {
+                if id.len() < h.hunk.id.len() {
+                    h.hunk.id.starts_with(id.as_str())
+                } else {
+                    h.hunk.id == *id
+                }
+            })
+        })
         .map(|(i, _)| i)
         .collect()
 }

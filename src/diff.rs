@@ -327,8 +327,12 @@ fn compute_hunk_id(hunk_type: &str, removed: &str, added: &str, context: Option<
     format!("{HUNK_ID_PREFIX}{}", hex_encode(&digest))
 }
 
+/// Normalize a hunk ID string. Accepts various prefixes (`hunk-`, `id:`,
+/// `sha:`, `sha256:`) and trailing `...` (for abbreviated IDs from diff output).
+/// Returns the normalized form `hunk-<hex>` which may be shorter than 64 chars
+/// for abbreviated IDs.
 pub fn normalize_hunk_id(value: &str) -> Option<String> {
-    let trimmed = value.trim();
+    let trimmed = value.trim().trim_end_matches("...");
     if trimmed.is_empty() {
         return None;
     }
