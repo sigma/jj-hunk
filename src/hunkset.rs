@@ -59,7 +59,7 @@ impl StringPattern {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
-enum Token {
+enum TokenKind {
     LParen,
     RParen,
     Pipe,
@@ -71,6 +71,12 @@ enum Token {
     Str(String),
     Number(usize),
     Colon,
+}
+
+#[derive(Debug, Clone)]
+struct Token {
+    kind: TokenKind,
+    pos: usize, // byte offset in the input
 }
 
 struct Tokenizer {
@@ -108,6 +114,10 @@ impl Tokenizer {
         }
     }
 
+    fn emit(&self, kind: TokenKind, pos: usize) -> Token {
+        Token { kind, pos }
+    }
+
     fn tokenize(&mut self) -> Result<Vec<Token>, String> {
         let mut tokens = Vec::new();
 
@@ -117,51 +127,53 @@ impl Tokenizer {
                 break;
             };
 
+            let start = self.pos;
             match ch {
                 '(' => {
                     self.next_char();
-                    tokens.push(Token::LParen);
+                    tokens.push(self.emit(TokenKind::LParen, start));
                 }
                 ')' => {
                     self.next_char();
-                    tokens.push(Token::RParen);
+                    tokens.push(self.emit(TokenKind::RParen, start));
                 }
                 '|' => {
                     self.next_char();
-                    tokens.push(Token::Pipe);
+                    tokens.push(self.emit(TokenKind::Pipe, start));
                 }
                 '&' => {
                     self.next_char();
-                    tokens.push(Token::Ampersand);
+                    tokens.push(self.emit(TokenKind::Ampersand, start));
                 }
                 '~' => {
                     self.next_char();
-                    tokens.push(Token::Tilde);
+                    tokens.push(self.emit(TokenKind::Tilde, start));
                 }
                 ',' => {
                     self.next_char();
-                    tokens.push(Token::Comma);
+                    tokens.push(self.emit(TokenKind::Comma, start));
                 }
                 ':' => {
                     self.next_char();
-                    tokens.push(Token::Colon);
+                    tokens.push(self.emit(TokenKind::Colon, start));
                 }
                 '.' => {
                     if self.chars.get(self.pos + 1) == Some(&'.') {
                         self.pos += 2;
-                        tokens.push(Token::DotDot);
+                        tokens.push(self.emit(TokenKind::DotDot, start));
                     } else {
                         return Err(format!("unexpected '.' at position {}", self.pos));
                     }
                 }
                 '"' => {
-                    tokens.push(self.read_string()?);
+                    let tok = self.read_string(start)?;
+                    tokens.push(tok);
                 }
                 _ if ch.is_ascii_digit() => {
-                    tokens.push(self.read_number());
+                    tokens.push(self.read_number(start));
                 }
                 _ if is_ident_start(ch) => {
-                    tokens.push(self.read_ident());
+                    tokens.push(self.read_ident(start));
                 }
                 _ => {
                     return Err(format!("unexpected character '{}' at position {}", ch, self.pos));
@@ -172,12 +184,12 @@ impl Tokenizer {
         Ok(tokens)
     }
 
-    fn read_string(&mut self) -> Result<Token, String> {
+    fn read_string(&mut self, start: usize) -> Result<Token, String> {
         self.next_char(); // consume opening quote
         let mut value = String::new();
         loop {
             match self.next_char() {
-                Some('"') => return Ok(Token::Str(value)),
+                Some('"') => return Ok(Token { kind: TokenKind::Str(value), pos: start }),
                 Some('\\') => match self.next_char() {
                     Some('n') => value.push('\n'),
                     Some('t') => value.push('\t'),
@@ -195,7 +207,7 @@ impl Tokenizer {
         }
     }
 
-    fn read_number(&mut self) -> Token {
+    fn read_number(&mut self, start: usize) -> Token {
         let mut n: usize = 0;
         while let Some(ch) = self.peek_char() {
             if ch.is_ascii_digit() {
@@ -205,10 +217,10 @@ impl Tokenizer {
                 break;
             }
         }
-        Token::Number(n)
+        Token { kind: TokenKind::Number(n), pos: start }
     }
 
-    fn read_ident(&mut self) -> Token {
+    fn read_ident(&mut self, start: usize) -> Token {
         let mut name = String::new();
         while let Some(ch) = self.peek_char() {
             if is_ident_char(ch) {
@@ -218,7 +230,7 @@ impl Tokenizer {
                 break;
             }
         }
-        Token::Ident(name)
+        Token { kind: TokenKind::Ident(name), pos: start }
     }
 }
 
@@ -235,20 +247,21 @@ fn is_ident_char(ch: char) -> bool {
 // ---------------------------------------------------------------------------
 
 struct Parser {
+    input: String,
     tokens: Vec<Token>,
     pos: usize,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+    fn new(input: &str, tokens: Vec<Token>) -> Self {
+        Self { input: input.to_string(), tokens, pos: 0 }
     }
 
-    fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos)
+    fn peek(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.pos).map(|t| &t.kind)
     }
 
-    fn next(&mut self) -> Option<Token> {
+    fn next_token(&mut self) -> Option<Token> {
         let tok = self.tokens.get(self.pos).cloned();
         if tok.is_some() {
             self.pos += 1;
@@ -256,19 +269,33 @@ impl Parser {
         tok
     }
 
-    fn expect(&mut self, expected: &Token) -> Result<(), String> {
-        match self.next() {
-            Some(ref tok) if tok == expected => Ok(()),
-            Some(tok) => Err(format!("expected {:?}, got {:?}", expected, tok)),
-            None => Err(format!("expected {:?}, got end of input", expected)),
+    fn next_kind(&mut self) -> Option<TokenKind> {
+        self.next_token().map(|t| t.kind)
+    }
+
+    fn expect(&mut self, expected: &TokenKind) -> Result<(), String> {
+        match self.next_token() {
+            Some(tok) if tok.kind == *expected => Ok(()),
+            Some(tok) => Err(self.error_at(tok.pos, &format!("expected {:?}, got {:?}", expected, tok.kind))),
+            None => Err(self.error_at(self.input.len(), &format!("expected {:?}, got end of input", expected))),
         }
+    }
+
+    fn error_at(&self, pos: usize, msg: &str) -> String {
+        let caret_line = format!("{}^", " ".repeat(pos));
+        format!("{}\n{}\n{}", self.input, caret_line, msg)
+    }
+
+    fn current_pos(&self) -> usize {
+        self.tokens.get(self.pos).map(|t| t.pos).unwrap_or(self.input.len())
     }
 
     /// hunkset = union
     fn parse(&mut self) -> Result<Expr, String> {
         let expr = self.parse_union()?;
         if self.pos < self.tokens.len() {
-            return Err(format!("unexpected token {:?}", self.tokens[self.pos]));
+            let tok = &self.tokens[self.pos];
+            return Err(self.error_at(tok.pos, &format!("unexpected {:?}", tok.kind)));
         }
         Ok(expr)
     }
@@ -276,8 +303,8 @@ impl Parser {
     /// union = intersection ("|" intersection)*
     fn parse_union(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_intersection()?;
-        while self.peek() == Some(&Token::Pipe) {
-            self.next();
+        while self.peek() == Some(&TokenKind::Pipe) {
+            self.next_kind();
             let right = self.parse_intersection()?;
             left = Expr::Union(Box::new(left), Box::new(right));
         }
@@ -287,8 +314,8 @@ impl Parser {
     /// intersection = difference ("&" difference)*
     fn parse_intersection(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_difference()?;
-        while self.peek() == Some(&Token::Ampersand) {
-            self.next();
+        while self.peek() == Some(&TokenKind::Ampersand) {
+            self.next_kind();
             let right = self.parse_difference()?;
             left = Expr::Intersection(Box::new(left), Box::new(right));
         }
@@ -298,8 +325,8 @@ impl Parser {
     /// difference = negation ("~" negation)?
     fn parse_difference(&mut self) -> Result<Expr, String> {
         let left = self.parse_negation()?;
-        if self.peek() == Some(&Token::Tilde) {
-            self.next();
+        if self.peek() == Some(&TokenKind::Tilde) {
+            self.next_kind();
             let right = self.parse_negation()?;
             Ok(Expr::Difference(Box::new(left), Box::new(right)))
         } else {
@@ -309,8 +336,8 @@ impl Parser {
 
     /// negation = "~" atom | atom
     fn parse_negation(&mut self) -> Result<Expr, String> {
-        if self.peek() == Some(&Token::Tilde) {
-            self.next();
+        if self.peek() == Some(&TokenKind::Tilde) {
+            self.next_kind();
             let atom = self.parse_atom()?;
             Ok(Expr::Negation(Box::new(atom)))
         } else {
@@ -321,50 +348,50 @@ impl Parser {
     /// atom = function_call | "(" hunkset ")" | "all()" | "none()"
     fn parse_atom(&mut self) -> Result<Expr, String> {
         match self.peek() {
-            Some(Token::LParen) => {
-                self.next();
+            Some(TokenKind::LParen) => {
+                self.next_kind();
                 let expr = self.parse_union()?;
-                self.expect(&Token::RParen)?;
+                self.expect(&TokenKind::RParen)?;
                 Ok(expr)
             }
-            Some(Token::Ident(_)) => self.parse_function_call(),
-            other => Err(format!("expected function or '(', got {:?}", other)),
+            Some(TokenKind::Ident(_)) => self.parse_function_call(),
+            _ => Err(self.error_at(self.current_pos(), "expected function or '('")),
         }
     }
 
     /// function_call = IDENT "(" args? ")"
     fn parse_function_call(&mut self) -> Result<Expr, String> {
-        let name = match self.next() {
-            Some(Token::Ident(name)) => name,
-            other => return Err(format!("expected function name, got {:?}", other)),
+        let name = match self.next_kind() {
+            Some(TokenKind::Ident(name)) => name,
+            _ => return Err(self.error_at(self.current_pos(), "expected function name")),
         };
 
         // all and none with no parens
-        if self.peek() != Some(&Token::LParen) {
+        if self.peek() != Some(&TokenKind::LParen) {
             return match name.as_str() {
                 "all" => Ok(Expr::All),
                 "none" => Ok(Expr::None),
-                _ => Err(format!("expected '(' after function name '{}'", name)),
+                _ => Err(self.error_at(self.current_pos(), &format!("expected '(' after '{}'", name))),
             };
         }
 
-        self.expect(&Token::LParen)?;
+        self.expect(&TokenKind::LParen)?;
 
         if name == "all" || name == "none" {
-            self.expect(&Token::RParen)?;
+            self.expect(&TokenKind::RParen)?;
             return Ok(if name == "all" { Expr::All } else { Expr::None });
         }
 
         let mut args = Vec::new();
-        if self.peek() != Some(&Token::RParen) {
+        if self.peek() != Some(&TokenKind::RParen) {
             args.push(self.parse_arg()?);
-            while self.peek() == Some(&Token::Comma) {
-                self.next();
+            while self.peek() == Some(&TokenKind::Comma) {
+                self.next_kind();
                 args.push(self.parse_arg()?);
             }
         }
 
-        self.expect(&Token::RParen)?;
+        self.expect(&TokenKind::RParen)?;
         Ok(Expr::Function(name, args))
     }
 
@@ -372,29 +399,28 @@ impl Parser {
     /// pattern = (IDENT ":")? (STRING | IDENT)
     /// number_range = NUMBER ".." NUMBER
     fn parse_arg(&mut self) -> Result<Arg, String> {
-        match self.peek() {
-            Some(Token::Number(_)) => {
-                let n = match self.next() {
-                    Some(Token::Number(n)) => n,
+        match self.peek().cloned() {
+            Some(TokenKind::Number(_)) => {
+                let n = match self.next_kind() {
+                    Some(TokenKind::Number(n)) => n,
                     _ => unreachable!(),
                 };
-                if self.peek() == Some(&Token::DotDot) {
-                    self.next();
-                    match self.next() {
-                        Some(Token::Number(m)) => Ok(Arg::Range(n, m)),
-                        other => Err(format!("expected number after '..', got {:?}", other)),
+                if self.peek() == Some(&TokenKind::DotDot) {
+                    self.next_kind();
+                    match self.next_kind() {
+                        Some(TokenKind::Number(m)) => Ok(Arg::Range(n, m)),
+                        _ => Err(self.error_at(self.current_pos(), "expected number after '..'")),
                     }
                 } else {
-                    // A bare number — treat as a pattern (for things like line numbers in other contexts)
                     Ok(Arg::Pattern(StringPattern {
                         kind: PatternKind::Exact,
                         value: n.to_string(),
                     }))
                 }
             }
-            Some(Token::Str(_)) => {
-                let value = match self.next() {
-                    Some(Token::Str(s)) => s,
+            Some(TokenKind::Str(_)) => {
+                let value = match self.next_kind() {
+                    Some(TokenKind::Str(s)) => s,
                     _ => unreachable!(),
                 };
                 Ok(Arg::Pattern(StringPattern {
@@ -402,29 +428,26 @@ impl Parser {
                     value,
                 }))
             }
-            Some(Token::Ident(_)) => {
-                let ident = match self.next() {
-                    Some(Token::Ident(s)) => s,
+            Some(TokenKind::Ident(_)) => {
+                let ident = match self.next_kind() {
+                    Some(TokenKind::Ident(s)) => s,
                     _ => unreachable!(),
                 };
                 // Check for pattern prefix: exact:, substring:, glob:, regex:
-                if self.peek() == Some(&Token::Colon) {
+                if self.peek() == Some(&TokenKind::Colon) {
                     let kind = match ident.as_str() {
                         "exact" => PatternKind::Exact,
                         "substring" => PatternKind::Substring,
                         "glob" => PatternKind::Glob,
                         "regex" => PatternKind::Regex,
-                        _ => return Err(format!("unknown pattern kind '{}'", ident)),
+                        _ => return Err(self.error_at(self.current_pos(), &format!("unknown pattern kind '{}'", ident))),
                     };
-                    self.next(); // consume colon
-                    let value = match self.next() {
-                        Some(Token::Str(s)) => s,
-                        Some(Token::Ident(s)) => s,
-                        other => {
-                            return Err(format!(
-                                "expected string after '{}:', got {:?}",
-                                ident, other
-                            ))
+                    self.next_kind(); // consume colon
+                    let value = match self.next_kind() {
+                        Some(TokenKind::Str(s)) => s,
+                        Some(TokenKind::Ident(s)) => s,
+                        _ => {
+                            return Err(self.error_at(self.current_pos(), &format!("expected string after '{}:'", ident)))
                         }
                     };
                     Ok(Arg::Pattern(StringPattern { kind, value }))
@@ -436,7 +459,7 @@ impl Parser {
                     }))
                 }
             }
-            other => Err(format!("expected argument, got {:?}", other)),
+            _ => Err(self.error_at(self.current_pos(), "expected argument")),
         }
     }
 }
@@ -444,11 +467,25 @@ impl Parser {
 /// Parse a hunkset expression string into an AST.
 pub fn parse(input: &str) -> Result<Expr, String> {
     let mut tokenizer = Tokenizer::new(input);
-    let tokens = tokenizer.tokenize()?;
+    let tokens = tokenizer.tokenize().map_err(|e| {
+        // Tokenizer errors already have position info — add the source line
+        if e.contains("at position") {
+            // Extract position number and add caret
+            if let Some(pos_str) = e.strip_suffix(|_: char| false).or(Some(&e)) {
+                if let Some(idx) = pos_str.rfind("position ") {
+                    if let Ok(pos) = pos_str[idx + 9..].trim().parse::<usize>() {
+                        let caret = format!("{}^", " ".repeat(pos));
+                        return format!("{}\n{}\n{}", input, caret, e);
+                    }
+                }
+            }
+        }
+        format!("{}\n{}", input, e)
+    })?;
     if tokens.is_empty() {
         return Err("empty hunkset expression".to_string());
     }
-    let mut parser = Parser::new(tokens);
+    let mut parser = Parser::new(input, tokens);
     parser.parse()
 }
 
@@ -972,22 +1009,26 @@ mod tests {
 
     // -- tokenizer tests --
 
+    fn kinds(tokens: &[Token]) -> Vec<&TokenKind> {
+        tokens.iter().map(|t| &t.kind).collect()
+    }
+
     #[test]
     fn tokenize_simple_expression() {
         let mut t = Tokenizer::new("type(insert) & file(\"src/lib.rs\")");
         let tokens = t.tokenize().unwrap();
         assert_eq!(
-            tokens,
+            kinds(&tokens),
             vec![
-                Token::Ident("type".into()),
-                Token::LParen,
-                Token::Ident("insert".into()),
-                Token::RParen,
-                Token::Ampersand,
-                Token::Ident("file".into()),
-                Token::LParen,
-                Token::Str("src/lib.rs".into()),
-                Token::RParen,
+                &TokenKind::Ident("type".into()),
+                &TokenKind::LParen,
+                &TokenKind::Ident("insert".into()),
+                &TokenKind::RParen,
+                &TokenKind::Ampersand,
+                &TokenKind::Ident("file".into()),
+                &TokenKind::LParen,
+                &TokenKind::Str("src/lib.rs".into()),
+                &TokenKind::RParen,
             ]
         );
     }
@@ -997,14 +1038,14 @@ mod tests {
         let mut t = Tokenizer::new("lines(10..20)");
         let tokens = t.tokenize().unwrap();
         assert_eq!(
-            tokens,
+            kinds(&tokens),
             vec![
-                Token::Ident("lines".into()),
-                Token::LParen,
-                Token::Number(10),
-                Token::DotDot,
-                Token::Number(20),
-                Token::RParen,
+                &TokenKind::Ident("lines".into()),
+                &TokenKind::LParen,
+                &TokenKind::Number(10),
+                &TokenKind::DotDot,
+                &TokenKind::Number(20),
+                &TokenKind::RParen,
             ]
         );
     }
@@ -1014,14 +1055,14 @@ mod tests {
         let mut t = Tokenizer::new(r#"added(regex:"fn\s+")"#);
         let tokens = t.tokenize().unwrap();
         assert_eq!(
-            tokens,
+            kinds(&tokens),
             vec![
-                Token::Ident("added".into()),
-                Token::LParen,
-                Token::Ident("regex".into()),
-                Token::Colon,
-                Token::Str(r"fn\s+".into()),
-                Token::RParen,
+                &TokenKind::Ident("added".into()),
+                &TokenKind::LParen,
+                &TokenKind::Ident("regex".into()),
+                &TokenKind::Colon,
+                &TokenKind::Str(r"fn\s+".into()),
+                &TokenKind::RParen,
             ]
         );
     }
@@ -1479,5 +1520,16 @@ mod tests {
         assert!(glob_match("src/**/*.rs", "src/lib.rs"));
         assert!(glob_match("src/**/*.rs", "src/sub/lib.rs"));
         assert!(!glob_match("src/**/*.rs", "tests/lib.rs"));
+    }
+
+    // -- error reporting tests --
+
+    #[test]
+    #[test]
+    fn parse_error_shows_caret() {
+        // Parser-level error: missing closing paren
+        let err = parse("type(insert").unwrap_err();
+        assert!(err.contains("type(insert"));
+        assert!(err.contains("^"));
     }
 }

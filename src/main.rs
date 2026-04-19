@@ -32,7 +32,7 @@ enum Commands {
 
     /// Split changes with hunk selection
     Split {
-        /// JSON/YAML spec string, or '-' for stdin (omit when using --spec-file)
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
         spec: Option<String>,
         /// Commit message
         message: Option<String>,
@@ -46,7 +46,7 @@ enum Commands {
 
     /// Commit selected hunks
     Commit {
-        /// JSON/YAML spec string, or '-' for stdin (omit when using --spec-file)
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
         spec: Option<String>,
         /// Commit message
         message: Option<String>,
@@ -57,7 +57,7 @@ enum Commands {
 
     /// Squash selected hunks into parent
     Squash {
-        /// JSON/YAML spec string, or '-' for stdin (omit when using --spec-file)
+        /// Hunk selection: hunkset expression, JSON/YAML spec, or '-' for stdin
         spec: Option<String>,
         /// Read spec from a file (JSON or YAML)
         #[arg(long = "spec-file", short = 'f')]
@@ -94,7 +94,7 @@ struct ListArgs {
     /// Truncate file contents to N lines before diffing
     #[arg(long)]
     max_lines: Option<usize>,
-    /// Optional JSON/YAML spec to preview (inline or '-')
+    /// Filter output with a hunkset expression or JSON/YAML spec
     #[arg(long)]
     spec: Option<String>,
     /// Read spec from a file (JSON or YAML)
