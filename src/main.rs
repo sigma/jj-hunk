@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 mod diff;
+mod glob;
 mod hunkset;
+#[cfg(feature = "semantic")]
 mod semantic;
 mod spec;
 mod commands;
@@ -88,12 +90,6 @@ struct ListArgs {
     /// Binary handling
     #[arg(long, value_enum, default_value_t = BinaryMode::Mark)]
     binary: BinaryMode,
-    /// Truncate file contents to N bytes before diffing
-    #[arg(long)]
-    max_bytes: Option<usize>,
-    /// Truncate file contents to N lines before diffing
-    #[arg(long)]
-    max_lines: Option<usize>,
     /// Filter output with a hunkset expression or JSON/YAML spec
     #[arg(long)]
     spec: Option<String>,
@@ -131,8 +127,6 @@ fn main() -> Result<()> {
                 spec: args.spec,
                 spec_file: args.spec_file,
                 binary: args.binary,
-                max_bytes: args.max_bytes,
-                max_lines: args.max_lines,
             };
 
             commands::list(options)

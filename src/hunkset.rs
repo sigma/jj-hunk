@@ -1,7 +1,43 @@
 use crate::diff::Hunk;
-use regex::Regex;
+use crate::glob::glob_match;
 use crate::spec::{DefaultAction, FileSpec, HunkSpec, Spec};
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum HunksetError {
+    #[error("{message}")]
+    Parse {
+        message: String,
+        input: String,
+        position: usize,
+    },
+    #[error("unknown function '{name}'")]
+    UnknownFunction { name: String },
+    #[error("invalid regex '{pattern}': {source}")]
+    InvalidRegex {
+        pattern: String,
+        source: regex::Error,
+    },
+}
+
+impl HunksetError {
+    /// Format the error with a caret pointing at the position in the input.
+    pub fn display_with_context(&self) -> String {
+        match self {
+            HunksetError::Parse { message, input, position } => {
+                let caret = format!("{}^", " ".repeat(*position));
+                format!("{}\n{}\n{}", input, caret, message)
+            }
+            other => format!("{}", other),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // AST
@@ -46,10 +82,11 @@ struct CompiledPattern {
 }
 
 impl CompiledPattern {
-    fn compile(pattern: &StringPattern) -> Result<Self, String> {
+    fn compile(pattern: &StringPattern) -> Result<Self, HunksetError> {
         let compiled_regex = if pattern.kind == PatternKind::Regex {
-            Some(Regex::new(&pattern.value).map_err(|e| {
-                format!("invalid regex '{}': {}", pattern.value, e)
+            Some(Regex::new(&pattern.value).map_err(|e| HunksetError::InvalidRegex {
+                pattern: pattern.value.clone(),
+                source: e,
             })?)
         } else {
             None
@@ -73,7 +110,7 @@ impl CompiledPattern {
     }
 }
 
-fn compile_patterns(patterns: Vec<StringPattern>) -> Result<Vec<CompiledPattern>, String> {
+fn compile_patterns(patterns: Vec<StringPattern>) -> Result<Vec<CompiledPattern>, HunksetError> {
     patterns.iter().map(CompiledPattern::compile).collect()
 }
 
@@ -193,7 +230,7 @@ impl Tokenizer {
                     tokens.push(tok);
                 }
                 _ if ch.is_ascii_digit() => {
-                    tokens.push(self.read_number(start));
+                    tokens.push(self.read_number(start)?);
                 }
                 _ if is_ident_start(ch) => {
                     tokens.push(self.read_ident(start));
@@ -230,17 +267,20 @@ impl Tokenizer {
         }
     }
 
-    fn read_number(&mut self, start: usize) -> Token {
-        let mut n: usize = 0;
+    fn read_number(&mut self, start: usize) -> Result<Token, String> {
+        let mut digits = String::new();
         while let Some(ch) = self.peek_char() {
             if ch.is_ascii_digit() {
-                n = n * 10 + (ch as usize - '0' as usize);
+                digits.push(ch);
                 self.next_char();
             } else {
                 break;
             }
         }
-        Token { kind: TokenKind::Number(n), pos: start }
+        let n: usize = digits.parse().map_err(|_| {
+            format!("number too large at position {}", start)
+        })?;
+        Ok(Token { kind: TokenKind::Number(n), pos: start })
     }
 
     fn read_ident(&mut self, start: usize) -> Token {
@@ -296,7 +336,7 @@ impl Parser {
         self.next_token().map(|t| t.kind)
     }
 
-    fn expect(&mut self, expected: &TokenKind) -> Result<(), String> {
+    fn expect(&mut self, expected: &TokenKind) -> Result<(), HunksetError> {
         match self.next_token() {
             Some(tok) if tok.kind == *expected => Ok(()),
             Some(tok) => Err(self.error_at(tok.pos, &format!("expected {:?}, got {:?}", expected, tok.kind))),
@@ -304,9 +344,12 @@ impl Parser {
         }
     }
 
-    fn error_at(&self, pos: usize, msg: &str) -> String {
-        let caret_line = format!("{}^", " ".repeat(pos));
-        format!("{}\n{}\n{}", self.input, caret_line, msg)
+    fn error_at(&self, pos: usize, msg: &str) -> HunksetError {
+        HunksetError::Parse {
+            message: msg.to_string(),
+            input: self.input.clone(),
+            position: pos,
+        }
     }
 
     fn current_pos(&self) -> usize {
@@ -314,7 +357,7 @@ impl Parser {
     }
 
     /// hunkset = union
-    fn parse(&mut self) -> Result<Expr, String> {
+    fn parse(&mut self) -> Result<Expr, HunksetError> {
         let expr = self.parse_union()?;
         if self.pos < self.tokens.len() {
             let tok = &self.tokens[self.pos];
@@ -324,7 +367,7 @@ impl Parser {
     }
 
     /// union = intersection ("|" intersection)*
-    fn parse_union(&mut self) -> Result<Expr, String> {
+    fn parse_union(&mut self) -> Result<Expr, HunksetError> {
         let mut left = self.parse_intersection()?;
         while self.peek() == Some(&TokenKind::Pipe) {
             self.next_kind();
@@ -335,7 +378,7 @@ impl Parser {
     }
 
     /// intersection = difference ("&" difference)*
-    fn parse_intersection(&mut self) -> Result<Expr, String> {
+    fn parse_intersection(&mut self) -> Result<Expr, HunksetError> {
         let mut left = self.parse_difference()?;
         while self.peek() == Some(&TokenKind::Ampersand) {
             self.next_kind();
@@ -346,7 +389,7 @@ impl Parser {
     }
 
     /// difference = negation ("~" negation)?
-    fn parse_difference(&mut self) -> Result<Expr, String> {
+    fn parse_difference(&mut self) -> Result<Expr, HunksetError> {
         let left = self.parse_negation()?;
         if self.peek() == Some(&TokenKind::Tilde) {
             self.next_kind();
@@ -358,7 +401,7 @@ impl Parser {
     }
 
     /// negation = "~" atom | atom
-    fn parse_negation(&mut self) -> Result<Expr, String> {
+    fn parse_negation(&mut self) -> Result<Expr, HunksetError> {
         if self.peek() == Some(&TokenKind::Tilde) {
             self.next_kind();
             let atom = self.parse_atom()?;
@@ -369,7 +412,7 @@ impl Parser {
     }
 
     /// atom = function_call | "(" hunkset ")" | "all()" | "none()"
-    fn parse_atom(&mut self) -> Result<Expr, String> {
+    fn parse_atom(&mut self) -> Result<Expr, HunksetError> {
         match self.peek() {
             Some(TokenKind::LParen) => {
                 self.next_kind();
@@ -383,7 +426,7 @@ impl Parser {
     }
 
     /// function_call = IDENT "(" args? ")"
-    fn parse_function_call(&mut self) -> Result<Expr, String> {
+    fn parse_function_call(&mut self) -> Result<Expr, HunksetError> {
         let name = match self.next_kind() {
             Some(TokenKind::Ident(name)) => name,
             _ => return Err(self.error_at(self.current_pos(), "expected function name")),
@@ -421,7 +464,7 @@ impl Parser {
     /// arg = pattern | number_range | number
     /// pattern = (IDENT ":")? (STRING | IDENT)
     /// number_range = NUMBER ".." NUMBER
-    fn parse_arg(&mut self) -> Result<Arg, String> {
+    fn parse_arg(&mut self) -> Result<Arg, HunksetError> {
         match self.peek().cloned() {
             Some(TokenKind::Number(_)) => {
                 let n = match self.next_kind() {
@@ -488,25 +531,26 @@ impl Parser {
 }
 
 /// Parse a hunkset expression string into an AST.
-pub fn parse(input: &str) -> Result<Expr, String> {
+pub fn parse(input: &str) -> Result<Expr, HunksetError> {
     let mut tokenizer = Tokenizer::new(input);
     let tokens = tokenizer.tokenize().map_err(|e| {
-        // Tokenizer errors already have position info — add the source line
-        if e.contains("at position") {
-            // Extract position number and add caret
-            if let Some(pos_str) = e.strip_suffix(|_: char| false).or(Some(&e)) {
-                if let Some(idx) = pos_str.rfind("position ") {
-                    if let Ok(pos) = pos_str[idx + 9..].trim().parse::<usize>() {
-                        let caret = format!("{}^", " ".repeat(pos));
-                        return format!("{}\n{}\n{}", input, caret, e);
-                    }
-                }
-            }
+        // Extract position from tokenizer error messages like "... at position N"
+        let pos = e
+            .rfind("position ")
+            .and_then(|idx| e[idx + 9..].trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        HunksetError::Parse {
+            message: e,
+            input: input.to_string(),
+            position: pos,
         }
-        format!("{}\n{}", input, e)
     })?;
     if tokens.is_empty() {
-        return Err("empty hunkset expression".to_string());
+        return Err(HunksetError::Parse {
+            message: "empty expression".to_string(),
+            input: input.to_string(),
+            position: 0,
+        });
     }
     let mut parser = Parser::new(input, tokens);
     parser.parse()
@@ -522,18 +566,11 @@ pub struct EnrichedHunk<'a> {
     pub file_path: &'a str,
     pub file_status: &'a str,
     pub hunk: &'a Hunk,
-    pub enclosing_function: Option<&'a str>,
-    pub enclosing_scope: Option<&'a str>,
-    pub annotations: &'a [String],
-    pub is_doc_comment: bool,
-    pub is_import: bool,
-    pub is_toplevel: bool,
-    pub nesting_depth: usize,
 }
 
 /// Evaluate a hunkset expression against a list of enriched hunks.
 /// Returns a set of indices into the input slice that match.
-pub fn evaluate(expr: &Expr, hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, String> {
+pub fn evaluate(expr: &Expr, hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, HunksetError> {
     match expr {
         Expr::All => Ok((0..hunks.len()).collect()),
         Expr::None => Ok(HashSet::new()),
@@ -562,12 +599,12 @@ pub fn evaluate(expr: &Expr, hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, S
     }
 }
 
-fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, String> {
+fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, HunksetError> {
     // Pre-compile patterns (validates regex upfront)
     let compiled = compile_patterns(extract_patterns(args))?;
 
     match name.as_ref() {
-        "file" => Ok(eval_file(args, &compiled, hunks)),
+        "file" => Ok(eval_file(args, hunks)),
         "glob" => Ok(eval_glob(args, hunks)),
         "extension" => Ok(eval_extension(&compiled, hunks)),
         "status" => Ok(eval_status(&compiled, hunks)),
@@ -586,7 +623,7 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
         "import" => Ok(eval_import(hunks)),
         "toplevel" => Ok(eval_toplevel(hunks)),
         "depth" => Ok(eval_depth(args, hunks)),
-        _ => Err(format!("unknown hunkset function '{}'", name)),
+        _ => Err(HunksetError::UnknownFunction { name: name.to_string() }),
     }
 }
 
@@ -610,9 +647,9 @@ where
 
 // --- file predicates ---
 
-fn eval_file(args: &[Arg], _compiled: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    // Default to exact matching for file paths (not substring).
-    // We re-compile here to override the pattern kind.
+/// file() defaults to exact matching for paths (not substring).
+/// Users can explicitly use `glob:` or `substring:` prefixes.
+fn eval_file(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
     let patterns: Vec<CompiledPattern> = extract_patterns(args)
         .into_iter()
         .map(|p| {
@@ -774,8 +811,8 @@ fn eval_semantic(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], field: Se
         .enumerate()
         .filter(|(_, h)| {
             let value = match field {
-                SemanticField::Function => h.enclosing_function,
-                SemanticField::Scope => h.enclosing_scope,
+                SemanticField::Function => h.hunk.semantic.enclosing_function.as_deref(),
+                SemanticField::Scope => h.hunk.semantic.enclosing_scope.as_deref(),
             };
             match value {
                 Some(v) => patterns.iter().any(|p| p.matches(v)),
@@ -784,24 +821,6 @@ fn eval_semantic(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], field: Se
         })
         .map(|(i, _)| i)
         .collect();
-
-    if result.is_empty() {
-        let field_name = match field {
-            SemanticField::Function => "function",
-            SemanticField::Scope => "scope",
-        };
-        let has_any_metadata = hunks.iter().any(|h| match field {
-            SemanticField::Function => h.enclosing_function.is_some(),
-            SemanticField::Scope => h.enclosing_scope.is_some(),
-        });
-        if !has_any_metadata {
-            eprintln!(
-                "warning: {}() requires semantic metadata (tree-sitter), \
-                 which is not yet available; returning empty set",
-                field_name
-            );
-        }
-    }
 
     result
 }
@@ -814,9 +833,9 @@ fn eval_annotation(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> Hash
         .enumerate()
         .filter(|(_, h)| {
             if patterns.is_empty() {
-                !h.annotations.is_empty()
+                !h.hunk.semantic.annotations.is_empty()
             } else {
-                h.annotations.iter().any(|ann| {
+                h.hunk.semantic.annotations.iter().any(|ann| {
                     patterns.iter().any(|p| p.matches(ann))
                 })
             }
@@ -831,7 +850,7 @@ fn eval_doc(hunks: &[EnrichedHunk]) -> HashSet<usize> {
     hunks
         .iter()
         .enumerate()
-        .filter(|(_, h)| h.is_doc_comment)
+        .filter(|(_, h)| h.hunk.semantic.is_doc_comment)
         .map(|(i, _)| i)
         .collect()
 }
@@ -842,7 +861,7 @@ fn eval_import(hunks: &[EnrichedHunk]) -> HashSet<usize> {
     hunks
         .iter()
         .enumerate()
-        .filter(|(_, h)| h.is_import)
+        .filter(|(_, h)| h.hunk.semantic.is_import)
         .map(|(i, _)| i)
         .collect()
 }
@@ -853,7 +872,7 @@ fn eval_toplevel(hunks: &[EnrichedHunk]) -> HashSet<usize> {
     hunks
         .iter()
         .enumerate()
-        .filter(|(_, h)| h.is_toplevel)
+        .filter(|(_, h)| h.hunk.semantic.is_toplevel)
         .map(|(i, _)| i)
         .collect()
 }
@@ -881,7 +900,7 @@ fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
         .iter()
         .enumerate()
         .filter(|(_, h)| {
-            let d = h.nesting_depth;
+            let d = h.hunk.semantic.nesting_depth;
             exact.contains(&d) || ranges.iter().any(|&(lo, hi)| d >= lo && d <= hi)
         })
         .map(|(i, _)| i)
@@ -947,84 +966,19 @@ pub fn to_spec(selected: &HashSet<usize>, hunks: &[EnrichedHunk]) -> Spec {
 // ---------------------------------------------------------------------------
 
 /// Returns true if the input looks like a hunkset expression rather than
-/// JSON or YAML.
+/// JSON or YAML. Uses a trial parse: if it parses as a hunkset, it is one.
 pub fn is_hunkset(input: &str) -> bool {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return false;
     }
-    // JSON starts with { or [
-    // YAML typically starts with a key: or --- or { or [
-    // Hunkset starts with an identifier, ~, or (
-    let first = trimmed.chars().next().unwrap();
-    matches!(first, 'a'..='z' | 'A'..='Z' | '_' | '~' | '(')
-}
-
-// ---------------------------------------------------------------------------
-// Glob matching (reused from commands.rs pattern, simplified)
-// ---------------------------------------------------------------------------
-
-fn glob_match(pattern: &str, path: &str) -> bool {
-    let pattern = pattern.trim_start_matches("./");
-    let path = path.trim_start_matches("./");
-
-    if pattern.contains('/') || pattern.contains("**") {
-        // Path-level glob: split on /
-        let pat_segs: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
-        let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        glob_match_segments(&pat_segs, &path_segs)
-    } else {
-        // Filename-only glob: match against the last path component
-        let filename = path.rsplit('/').next().unwrap_or(path);
-        glob_match_segment(pattern, filename)
-    }
-}
-
-fn glob_match_segments(pattern: &[&str], path: &[&str]) -> bool {
-    if pattern.is_empty() {
-        return path.is_empty();
-    }
-    if pattern[0] == "**" {
-        if glob_match_segments(&pattern[1..], path) {
-            return true;
-        }
-        if !path.is_empty() {
-            return glob_match_segments(pattern, &path[1..]);
-        }
+    // Quick reject: JSON/YAML object/array literals
+    let first = trimmed.as_bytes()[0];
+    if first == b'{' || first == b'[' {
         return false;
     }
-    if path.is_empty() {
-        return false;
-    }
-    if !glob_match_segment(pattern[0], path[0]) {
-        return false;
-    }
-    glob_match_segments(&pattern[1..], &path[1..])
-}
-
-fn glob_match_segment(pattern: &str, text: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let pat: Vec<char> = pattern.chars().collect();
-    let txt: Vec<char> = text.chars().collect();
-    let mut dp = vec![vec![false; txt.len() + 1]; pat.len() + 1];
-    dp[0][0] = true;
-    for i in 1..=pat.len() {
-        if pat[i - 1] == '*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-    }
-    for i in 1..=pat.len() {
-        for j in 1..=txt.len() {
-            dp[i][j] = match pat[i - 1] {
-                '*' => dp[i - 1][j] || dp[i][j - 1],
-                '?' => dp[i - 1][j - 1],
-                c => dp[i - 1][j - 1] && c == txt[j - 1],
-            };
-        }
-    }
-    dp[pat.len()][txt.len()]
+    // Trial parse: if it tokenizes and parses as a valid hunkset, treat it as one.
+    parse(trimmed).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,13 +1188,7 @@ mod tests {
                 length: if added.is_empty() { 0 } else { added.lines().count() },
             },
             context: None,
-            enclosing_function: None,
-            enclosing_scope: None,
-            annotations: Vec::new(),
-            is_doc_comment: false,
-            is_import: false,
-            is_toplevel: false,
-            nesting_depth: 0,
+            semantic: crate::diff::SemanticInfo::default(),
         }
     }
 
@@ -1257,13 +1205,6 @@ mod tests {
                 file_path: "src/lib.rs",
                 file_status: "modified",
                 hunk: h,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             })
             .collect();
 
@@ -1285,25 +1226,11 @@ mod tests {
                 file_path: "src/lib.rs",
                 file_status: "modified",
                 hunk: &h1,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "tests/test.rs",
                 file_status: "added",
                 hunk: &h2,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
         ];
 
@@ -1321,25 +1248,11 @@ mod tests {
                 file_path: "src/lib.rs",
                 file_status: "modified",
                 hunk: &h1,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "tests/test.rs",
                 file_status: "added",
                 hunk: &h2,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
         ];
 
@@ -1357,25 +1270,11 @@ mod tests {
                 file_path: "a.rs",
                 file_status: "modified",
                 hunk: &h1,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "b.rs",
                 file_status: "modified",
                 hunk: &h2,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
         ];
 
@@ -1398,37 +1297,16 @@ mod tests {
                 file_path: "src/a.rs",
                 file_status: "modified",
                 hunk: &h1,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "src/b.rs",
                 file_status: "modified",
                 hunk: &h2,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "tests/c.rs",
                 file_status: "modified",
                 hunk: &h3,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
         ];
 
@@ -1456,25 +1334,11 @@ mod tests {
                 file_path: "a.rs",
                 file_status: "modified",
                 hunk: &h1,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "a.rs",
                 file_status: "modified",
                 hunk: &h2,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
         ];
 
@@ -1496,25 +1360,11 @@ mod tests {
                 file_path: "src/a.rs",
                 file_status: "modified",
                 hunk: &h1,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "src/b.rs",
                 file_status: "modified",
                 hunk: &h2,
-                enclosing_function: None,
-                enclosing_scope: None,
-                annotations: &[],
-                is_doc_comment: false,
-                is_import: false,
-                is_toplevel: true,
-                nesting_depth: 0,
             },
         ];
 
@@ -1538,26 +1388,27 @@ mod tests {
         assert!(!is_hunkset("[1, 2, 3]"));
     }
 
-    // -- glob tests --
-
-    #[test]
-    fn glob_match_basic() {
-        assert!(glob_match("*.rs", "lib.rs"));
-        assert!(glob_match("*.rs", "src/lib.rs")); // filename-only when no /
-        assert!(!glob_match("*.rs", "lib.py"));
-        assert!(glob_match("src/**/*.rs", "src/lib.rs"));
-        assert!(glob_match("src/**/*.rs", "src/sub/lib.rs"));
-        assert!(!glob_match("src/**/*.rs", "tests/lib.rs"));
-    }
-
     // -- error reporting tests --
 
-    #[test]
     #[test]
     fn parse_error_shows_caret() {
         // Parser-level error: missing closing paren
         let err = parse("type(insert").unwrap_err();
-        assert!(err.contains("type(insert"));
-        assert!(err.contains("^"));
+        let display = err.display_with_context();
+        assert!(display.contains("type(insert"));
+        assert!(display.contains("^"));
+    }
+
+    #[test]
+    fn unknown_function_is_error() {
+        let h = make_hunk(0, "insert", "", "x\n");
+        let enriched = vec![EnrichedHunk {
+            file_path: "a.rs",
+            file_status: "modified",
+            hunk: &h,
+        }];
+        let expr = parse("functon(\"foo\")").unwrap();
+        let err = evaluate(&expr, &enriched).unwrap_err();
+        assert!(matches!(err, HunksetError::UnknownFunction { .. }));
     }
 }

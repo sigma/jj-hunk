@@ -26,20 +26,9 @@ pub struct HunkContext {
     pub after: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct Hunk {
-    pub index: usize,
-    pub id: String,
-    #[serde(rename = "type")]
-    pub hunk_type: String,
-    pub removed: String,
-    pub added: String,
-    #[serde(rename = "before")]
-    pub before_range: LineRange,
-    #[serde(rename = "after")]
-    pub after_range: LineRange,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<HunkContext>,
+/// Semantic metadata extracted via tree-sitter (when the `semantic` feature is enabled).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SemanticInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enclosing_function: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,6 +43,24 @@ pub struct Hunk {
     pub is_toplevel: bool,
     #[serde(skip_serializing_if = "is_zero")]
     pub nesting_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Hunk {
+    pub index: usize,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub hunk_type: String,
+    pub removed: String,
+    pub added: String,
+    #[serde(rename = "before")]
+    pub before_range: LineRange,
+    #[serde(rename = "after")]
+    pub after_range: LineRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<HunkContext>,
+    #[serde(flatten)]
+    pub semantic: SemanticInfo,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -185,13 +192,7 @@ fn finalize_hunk(
         before_range,
         after_range,
         context,
-        enclosing_function: None,
-        enclosing_scope: None,
-        annotations: Vec::new(),
-        is_doc_comment: false,
-        is_import: false,
-        is_toplevel: false,
-        nesting_depth: 0,
+        semantic: SemanticInfo::default(),
     });
 }
 

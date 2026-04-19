@@ -1,5 +1,7 @@
 use crate::diff::{apply_selected_hunks, get_hunks, Hunk, HunkSelection};
+use crate::glob::glob_match;
 use crate::hunkset::{self, EnrichedHunk};
+#[cfg(feature = "semantic")]
 use crate::semantic;
 use crate::spec::{Action, DefaultAction, FileSpec, Spec};
 use anyhow::{Context, Result};
@@ -80,8 +82,6 @@ pub struct ListOptions {
     pub spec: Option<String>,
     pub spec_file: Option<String>,
     pub binary: BinaryMode,
-    pub max_bytes: Option<usize>,
-    pub max_lines: Option<usize>,
 }
 
 impl Default for ListOptions {
@@ -96,8 +96,6 @@ impl Default for ListOptions {
             spec: None,
             spec_file: None,
             binary: BinaryMode::default(),
-            max_bytes: None,
-            max_lines: None,
         }
     }
 }
@@ -213,89 +211,44 @@ where
     let include = normalize_patterns(&options.include);
     let exclude = normalize_patterns(&options.exclude);
 
-    let summary_entries = read_diff_summary(options.rev.as_deref())?;
-    let (before_rev, after_rev) = resolve_revisions(options.rev.as_deref());
+    let all_file_hunks = load_file_hunks(options.rev.as_deref())?;
 
     let mut files = Vec::new();
 
-    for entry in summary_entries {
-        let path = primary_path(&entry);
-        if path.is_empty() {
+    for fh in all_file_hunks {
+        if !include.is_empty() && !matches_any(&include, &fh.path) {
+            continue;
+        }
+        if !exclude.is_empty() && matches_any(&exclude, &fh.path) {
             continue;
         }
 
-        if !should_include_entry(&entry, &include, &exclude) {
+        if fh.is_binary && options.binary == BinaryMode::Skip {
             continue;
         }
 
-        let decision = spec_decision(spec.as_ref(), &path);
+        let decision = spec_decision(spec.as_ref(), &fh.path);
         if matches!(decision, SpecDecision::Skip) {
             continue;
         }
 
-        let file_paths = file_paths_for_entry(&entry, &path);
-        let before_bytes = file_paths
-            .before
-            .as_deref()
-            .map(|p| read_jj_file(before_rev.as_deref(), p))
-            .unwrap_or_default();
-        let after_bytes = file_paths
-            .after
-            .as_deref()
-            .map(|p| read_jj_file(after_rev.as_deref(), p))
-            .unwrap_or_default();
-
-        let is_binary = is_binary_data(&before_bytes) || is_binary_data(&after_bytes);
-        if is_binary && options.binary == BinaryMode::Skip {
-            continue;
-        }
-
-        let should_diff = !(is_binary && options.binary == BinaryMode::Mark);
-        let (before_text, before_truncated) = if should_diff {
-            truncate_text(
-                &String::from_utf8_lossy(&before_bytes),
-                options.max_bytes,
-                options.max_lines,
-            )
-        } else {
-            (String::new(), false)
-        };
-        let (after_text, after_truncated) = if should_diff {
-            truncate_text(
-                &String::from_utf8_lossy(&after_bytes),
-                options.max_bytes,
-                options.max_lines,
-            )
-        } else {
-            (String::new(), false)
-        };
-
-        let mut hunks = if should_diff {
-            get_hunks(&before_text, &after_text)
-        } else {
-            Vec::new()
-        };
-
-        enrich_hunks_with_semantics(&mut hunks, &path, &before_text, &after_text);
+        let mut hunks = fh.hunks;
 
         if let SpecDecision::KeepSelection(selection) = &decision {
             hunks = filter_hunks(hunks, selection);
         }
 
-        if hunks.is_empty() && !is_binary {
+        if hunks.is_empty() && !fh.is_binary {
             continue;
         }
 
-        let rename = rename_info(&entry);
-        let truncated = before_truncated || after_truncated;
-
         files.push(FileEntry {
-            path,
-            status: entry.status.clone(),
-            rename,
+            path: fh.path,
+            status: fh.status,
+            rename: fh.rename,
             hunks,
-            binary: if is_binary { Some(true) } else { None },
-            truncated: if truncated { Some(true) } else { None },
+            binary: if fh.is_binary { Some(true) } else { None },
+            truncated: None,
         });
     }
 
@@ -373,6 +326,7 @@ enum SpecDecision {
     KeepSelection(HunkSelection),
 }
 
+#[cfg(feature = "semantic")]
 fn enrich_hunks_with_semantics(
     hunks: &mut [Hunk],
     path: &str,
@@ -408,14 +362,25 @@ fn enrich_hunks_with_semantics(
     let contexts = semantic::contexts_for_lines(ext, source, &lines);
 
     for (hunk, ctx) in hunks.iter_mut().zip(contexts.into_iter()) {
-        hunk.enclosing_function = ctx.enclosing_function;
-        hunk.enclosing_scope = ctx.enclosing_scope;
-        hunk.annotations = ctx.annotations;
-        hunk.is_doc_comment = ctx.is_doc_comment;
-        hunk.is_import = ctx.is_import;
-        hunk.is_toplevel = ctx.is_toplevel;
-        hunk.nesting_depth = ctx.nesting_depth;
+        hunk.semantic = crate::diff::SemanticInfo {
+            enclosing_function: ctx.enclosing_function,
+            enclosing_scope: ctx.enclosing_scope,
+            annotations: ctx.annotations,
+            is_doc_comment: ctx.is_doc_comment,
+            is_import: ctx.is_import,
+            is_toplevel: ctx.is_toplevel,
+            nesting_depth: ctx.nesting_depth,
+        };
     }
+}
+
+#[cfg(not(feature = "semantic"))]
+fn enrich_hunks_with_semantics(
+    _hunks: &mut [Hunk],
+    _path: &str,
+    _before_text: &str,
+    _after_text: &str,
+) {
 }
 
 fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<Option<String>> {
@@ -430,13 +395,43 @@ fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<
 /// revision, returning a JSON-serialized Spec.
 fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
     let ast = hunkset::parse(hunkset_expr)
-        .map_err(|e| anyhow::anyhow!("failed to parse hunkset: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to parse hunkset:\n{}", e.display_with_context()))?;
 
+    let file_hunks = load_file_hunks(rev)?;
+
+    let enriched: Vec<EnrichedHunk> = file_hunks
+        .iter()
+        .flat_map(|fh| {
+            fh.hunks.iter().map(move |hunk| EnrichedHunk {
+                file_path: &fh.path,
+                file_status: &fh.status,
+                hunk,
+            })
+        })
+        .collect();
+
+    let selected = hunkset::evaluate(&ast, &enriched)
+        .map_err(|e| anyhow::anyhow!("hunkset evaluation error: {}", e.display_with_context()))?;
+    let spec = hunkset::to_spec(&selected, &enriched);
+
+    serde_json::to_string(&spec).context("failed to serialize hunkset result as spec")
+}
+
+/// A file's hunks with metadata, loaded from a jj diff.
+struct FileHunks {
+    path: String,
+    status: String,
+    hunks: Vec<Hunk>,
+    rename: Option<RenameInfo>,
+    is_binary: bool,
+}
+
+/// Load all file hunks for a revision, applying semantic enrichment.
+/// This is the shared core used by both `list` and `evaluate_hunkset`.
+fn load_file_hunks(rev: Option<&str>) -> Result<Vec<FileHunks>> {
     let summary_entries = read_diff_summary(rev)?;
     let (before_rev, after_rev) = resolve_revisions(rev);
-
-    // Collect all hunks with file context
-    let mut file_hunks: Vec<(String, String, Vec<Hunk>)> = Vec::new();
+    let mut result = Vec::new();
 
     for entry in &summary_entries {
         let path = primary_path(entry);
@@ -456,45 +451,35 @@ fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
             .map(|p| read_jj_file(after_rev.as_deref(), p))
             .unwrap_or_default();
 
-        if is_binary_data(&before_bytes) || is_binary_data(&after_bytes) {
-            continue;
-        }
+        let is_binary = is_binary_data(&before_bytes) || is_binary_data(&after_bytes);
 
-        let before_text = String::from_utf8_lossy(&before_bytes);
-        let after_text = String::from_utf8_lossy(&after_bytes);
-        let mut hunks = get_hunks(&before_text, &after_text);
+        let (before_text, after_text) = if !is_binary {
+            (
+                String::from_utf8_lossy(&before_bytes).into_owned(),
+                String::from_utf8_lossy(&after_bytes).into_owned(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
+        let mut hunks = if !is_binary {
+            get_hunks(&before_text, &after_text)
+        } else {
+            Vec::new()
+        };
 
         enrich_hunks_with_semantics(&mut hunks, &path, &before_text, &after_text);
 
-        if !hunks.is_empty() {
-            file_hunks.push((path, entry.status.clone(), hunks));
-        }
+        result.push(FileHunks {
+            path,
+            status: entry.status.clone(),
+            hunks,
+            rename: rename_info(entry),
+            is_binary,
+        });
     }
 
-    // Build enriched hunks
-    let enriched: Vec<EnrichedHunk> = file_hunks
-        .iter()
-        .flat_map(|(path, status, hunks)| {
-            hunks.iter().map(move |hunk| EnrichedHunk {
-                file_path: path,
-                file_status: status,
-                hunk,
-                enclosing_function: hunk.enclosing_function.as_deref(),
-                enclosing_scope: hunk.enclosing_scope.as_deref(),
-                annotations: &hunk.annotations,
-                is_doc_comment: hunk.is_doc_comment,
-                is_import: hunk.is_import,
-                is_toplevel: hunk.is_toplevel,
-                nesting_depth: hunk.nesting_depth,
-            })
-        })
-        .collect();
-
-    let selected = hunkset::evaluate(&ast, &enriched)
-        .map_err(|e| anyhow::anyhow!("hunkset evaluation error: {}", e))?;
-    let spec = hunkset::to_spec(&selected, &enriched);
-
-    serde_json::to_string(&spec).context("failed to serialize hunkset result as spec")
+    Ok(result)
 }
 
 fn resolve_revisions(revset: Option<&str>) -> (Option<String>, Option<String>) {
@@ -622,51 +607,6 @@ fn is_binary_data(bytes: &[u8]) -> bool {
     bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
 }
 
-fn truncate_text(
-    content: &str,
-    max_bytes: Option<usize>,
-    max_lines: Option<usize>,
-) -> (String, bool) {
-    let mut truncated = false;
-    let mut result = content.to_string();
-
-    if let Some(max_lines) = max_lines {
-        if max_lines == 0 {
-            if !result.is_empty() {
-                truncated = true;
-            }
-            result.clear();
-        } else {
-            let mut limited = String::new();
-            let mut count = 0usize;
-            for line in result.split_inclusive('\n') {
-                if count >= max_lines {
-                    truncated = true;
-                    break;
-                }
-                limited.push_str(line);
-                count += 1;
-            }
-            if truncated {
-                result = limited;
-            }
-        }
-    }
-
-    if let Some(max_bytes) = max_bytes {
-        if result.len() > max_bytes {
-            let mut end = max_bytes;
-            while !result.is_char_boundary(end) {
-                end -= 1;
-            }
-            result.truncate(end);
-            truncated = true;
-        }
-    }
-
-    (result, truncated)
-}
-
 fn spec_decision(spec: Option<&Spec>, path: &str) -> SpecDecision {
     let Some(spec) = spec else {
         return SpecDecision::KeepAll;
@@ -713,105 +653,8 @@ fn normalize_patterns(patterns: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn should_include_entry(entry: &DiffSummaryEntry, include: &[String], exclude: &[String]) -> bool {
-    let paths = entry_paths(entry);
-
-    if !include.is_empty() && !paths.iter().any(|path| matches_any(include, path)) {
-        return false;
-    }
-
-    if !exclude.is_empty() && paths.iter().any(|path| matches_any(exclude, path)) {
-        return false;
-    }
-
-    true
-}
-
-fn entry_paths<'a>(entry: &'a DiffSummaryEntry) -> Vec<&'a str> {
-    let mut paths = Vec::new();
-    if !entry.path.is_empty() {
-        paths.push(entry.path.as_str());
-    }
-    if !entry.source.is_empty() && entry.source != entry.path {
-        paths.push(entry.source.as_str());
-    }
-    if !entry.target.is_empty() && entry.target != entry.path && entry.target != entry.source {
-        paths.push(entry.target.as_str());
-    }
-    paths
-}
-
 fn matches_any(patterns: &[String], path: &str) -> bool {
     patterns.iter().any(|pattern| glob_match(pattern, path))
-}
-
-fn glob_match(pattern: &str, path: &str) -> bool {
-    let pattern = pattern.trim_start_matches("./");
-    let path = path.trim_start_matches("./");
-
-    if pattern.is_empty() {
-        return path.is_empty();
-    }
-
-    let pattern_segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
-    let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    match_segments(&pattern_segments, &path_segments)
-}
-
-fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
-    if pattern.is_empty() {
-        return path.is_empty();
-    }
-
-    if pattern[0] == "**" {
-        if match_segments(&pattern[1..], path) {
-            return true;
-        }
-        if !path.is_empty() {
-            return match_segments(pattern, &path[1..]);
-        }
-        return false;
-    }
-
-    if path.is_empty() {
-        return false;
-    }
-
-    if !match_segment(pattern[0], path[0]) {
-        return false;
-    }
-
-    match_segments(&pattern[1..], &path[1..])
-}
-
-fn match_segment(pattern: &str, text: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-    let text_chars: Vec<char> = text.chars().collect();
-    let mut dp = vec![vec![false; text_chars.len() + 1]; pattern_chars.len() + 1];
-
-    dp[0][0] = true;
-    for i in 1..=pattern_chars.len() {
-        if pattern_chars[i - 1] == '*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-    }
-
-    for i in 1..=pattern_chars.len() {
-        for j in 1..=text_chars.len() {
-            dp[i][j] = match pattern_chars[i - 1] {
-                '*' => dp[i - 1][j] || dp[i][j - 1],
-                '?' => dp[i - 1][j - 1],
-                c => dp[i - 1][j - 1] && c == text_chars[j - 1],
-            };
-        }
-    }
-
-    dp[pattern_chars.len()][text_chars.len()]
 }
 
 fn group_files(files: Vec<FileEntry>, grouping: ListGrouping) -> Vec<ListGroup> {
@@ -1007,13 +850,13 @@ fn format_files_text(lines: &mut Vec<String>, files: &[FileEntry]) {
                 hunk.after_range.start,
                 hunk.after_range.length,
             );
-            if let Some(scope) = &hunk.enclosing_scope {
-                if let Some(func) = &hunk.enclosing_function {
+            if let Some(scope) = &hunk.semantic.enclosing_scope {
+                if let Some(func) = &hunk.semantic.enclosing_function {
                     hunk_line.push_str(&format!(" in {}::{}", scope, func));
                 } else {
                     hunk_line.push_str(&format!(" in {}", scope));
                 }
-            } else if let Some(func) = &hunk.enclosing_function {
+            } else if let Some(func) = &hunk.semantic.enclosing_function {
                 hunk_line.push_str(&format!(" in {}", func));
             }
             lines.push(hunk_line);
