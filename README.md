@@ -37,7 +37,10 @@ jj-hunk list --files
 # Emit a spec template using stable ids
 jj-hunk list --spec-template --format yaml
 
-# Split changes: hunks 0,1 of foo.rs → first commit, rest → second
+# Split using hunkset query: all insertions in foo.rs
+jj-hunk split 'type(insert) & file("src/foo.rs")' "new code in foo"
+
+# Split using JSON spec: hunks 0,1 of foo.rs → first commit, rest → second
 jj-hunk split '{"files": {"src/foo.rs": {"hunks": [0, 1]}}, "default": "reset"}' "first commit"
 
 # Split a specific revision (not just working copy)
@@ -77,11 +80,11 @@ List options:
 - `--group none|directory|extension|status` — group output
 - `--binary skip|mark|include` — binary handling (default: mark)
 - `--max-bytes <n>` / `--max-lines <n>` — truncate before diffing
-- `--spec <json|yaml>` / `--spec-file <path>` — preview using a spec filter
+- `--spec <hunkset|json|yaml>` / `--spec-file <path>` — filter output with a hunkset expression or JSON/YAML spec
 - `--files` — list files with hunk counts only
 - `--spec-template` — emit a spec template (JSON/YAML only)
 
-`<spec>` may be an inline JSON/YAML string or `-` to read from stdin. Use `--spec-file <path>` to read a JSON/YAML file (omit `<spec>` when using `--spec-file`).
+`<spec>` may be a hunkset expression (e.g. `'type(insert) & file("src/*.rs")'`), an inline JSON/YAML string, or `-` to read from stdin. The format is auto-detected. Use `--spec-file <path>` to read a JSON/YAML file (omit `<spec>` when using `--spec-file`).
 
 ## Spec Format
 
@@ -107,6 +110,129 @@ Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `-
 
 `ids` and `hunks` are merged if both are provided. Use `jj-hunk list --spec-template` to generate an id-based starting spec.
 
+## Hunkset Query Language
+
+As an alternative to JSON/YAML specs, jj-hunk supports a **hunkset** query language inspired by jj's [filesets](https://docs.jj-vcs.dev/latest/filesets/) and [revsets](https://docs.jj-vcs.dev/latest/revsets/). Hunkset expressions are auto-detected (anything that doesn't start with `{` or `[`).
+
+```bash
+# Split: all insertions in Rust files
+jj-hunk split 'type(insert) & glob("src/**/*.rs")' "add new code"
+
+# List only hunks inside a specific function
+jj-hunk list --spec 'function("parse_spec")'
+
+# Verify a selection covers all changes in a scope
+jj-hunk list --spec 'function("apply") ~ id("hunk-7c3d...")'
+# Empty output = the id covers everything in that function
+```
+
+### Operators
+
+Hunkset expressions compose using set algebra, from lowest to highest precedence:
+
+| Operator | Meaning | Example |
+|----------|---------|---------|
+| `x \| y` | Union | `type(insert) \| type(delete)` |
+| `x & y` | Intersection | `type(insert) & glob("src/**")` |
+| `x ~ y` | Difference (x but not y) | `all() ~ type(delete)` |
+| `~x` | Negation (complement) | `~type(delete)` |
+| `(x)` | Grouping | `(type(insert) \| type(replace)) & file("x")` |
+
+### Functions
+
+#### File predicates
+
+| Function | Description |
+|----------|-------------|
+| `file("path")` | Hunks in file matching path (exact match) |
+| `glob("pattern")` | Hunks in files matching glob pattern |
+| `extension("rs")` | Hunks in files with given extension |
+| `status(modified)` | Hunks in files with given status (modified, added, removed, renamed, copied) |
+
+#### Hunk type
+
+| Function | Description |
+|----------|-------------|
+| `type(insert)` | Insertions only |
+| `type(delete)` | Deletions only |
+| `type(replace)` | Replacements only |
+
+#### Line ranges
+
+| Function | Description |
+|----------|-------------|
+| `lines(10..20)` | Hunks touching lines 10-20 (before or after) |
+| `before_line(10..20)` | Hunks in the "before" line range |
+| `after_line(10..20)` | Hunks in the "after" line range |
+
+#### Content matching
+
+| Function | Description |
+|----------|-------------|
+| `content("text")` | Hunks where added or removed text contains "text" |
+| `added("text")` | Hunks where added text contains "text" |
+| `removed("text")` | Hunks where removed text contains "text" |
+
+#### Identity
+
+| Function | Description |
+|----------|-------------|
+| `id("hunk-...")` | Select by stable hunk ID (from `jj-hunk list`) |
+
+#### Semantic (tree-sitter powered)
+
+These predicates use tree-sitter to parse source files and extract structural information. Supported languages: Rust, Python, JavaScript, TypeScript, Go, C, C++, Java, Ruby, C#, Scala, Swift, PHP, Bash, Elixir, Erlang, Haskell, OCaml, Zig, Lua.
+
+| Function | Description |
+|----------|-------------|
+| `function("name")` | Hunks inside a function/method with given name |
+| `scope("name")` | Hunks inside a scope (class, struct, impl, module, etc.) |
+| `annotation("test")` | Hunks inside functions/scopes with matching annotation/decorator |
+| `decorator("route")` | Alias for `annotation()` |
+| `doc()` | Hunks that are doc comments |
+| `import()` | Hunks that are import/use/require statements |
+| `toplevel()` | Hunks not inside any function or scope |
+| `depth(0)` | Hunks at nesting depth 0 (top-level); accepts ranges like `depth(0..1)` |
+| `all()` | All hunks |
+| `none()` | No hunks |
+
+For unsupported languages, `function()`, `scope()`, and other semantic predicates return empty sets with a warning.
+
+### Pattern syntax
+
+String arguments support pattern prefixes, following jj conventions:
+
+| Prefix | Meaning | Example |
+|--------|---------|---------|
+| (none) | Substring for content, exact for identifiers | `added("TODO")` |
+| `exact:"text"` | Exact match | `file(exact:"src/lib.rs")` |
+| `substring:"text"` | Substring match | `function(substring:"test")` |
+| `glob:"pattern"` | Glob pattern | `file(glob:"src/**/*.rs")` |
+| `regex:"pattern"` | Regular expression | `added(regex:"fn\\s+\\w+")` |
+
+### Examples
+
+```bash
+# Separate test changes from implementation
+jj-hunk split 'annotation("test")' "test: add unit tests"
+jj-hunk split 'all() ~ annotation("test")' "feat: implementation"
+
+# Commit only import changes
+jj-hunk split 'import()' "chore: update imports"
+
+# Commit doc changes separately
+jj-hunk split 'doc()' "docs: update documentation"
+
+# All changes in a specific class
+jj-hunk split 'scope("UserService")' "refactor: update UserService"
+
+# Top-level changes only (constants, types, not inside functions)
+jj-hunk split 'toplevel() ~ import()' "refactor: update type definitions"
+
+# Hunks adding TODO/FIXME comments
+jj-hunk list --spec 'added(regex:"(TODO|FIXME)")'
+```
+
 ## Example Output
 
 ```bash
@@ -125,7 +251,9 @@ $ jj-hunk list --format json
           "added": "new_fn()\n",
           "before": {"start": 10, "lines": 1},
           "after": {"start": 10, "lines": 1},
-          "context": {"pre": "// prev\n", "post": "// next\n"}
+          "context": {"pre": "// prev\n", "post": "// next\n"},
+          "enclosing_function": "my_func",
+          "enclosing_scope": "MyStruct"
         }
       ]
     },
@@ -150,6 +278,7 @@ $ jj-hunk list --format json
 
 - `files` is a list of file entries. Each entry includes `status`, optional `rename`, and `hunks`.
 - Each hunk includes a stable `id` (sha256), `index`, line ranges (`before`/`after`), and optional `context`.
+- When tree-sitter can parse the file, hunks include `enclosing_function`, `enclosing_scope`, `annotations`, `is_doc_comment`, `is_import`, `is_toplevel`, and `nesting_depth` (all omitted when empty/false/zero).
 - When grouped (`--group`), output uses `groups: [{name, files}]` instead of `files`.
 
 ### List Modes
@@ -172,7 +301,7 @@ jj-hunk list --include 'src/**' --exclude '**/*.test.rs' --group directory
 
 jj-hunk integrates with jj's `--tool` mechanism:
 
-1. You run `jj-hunk split/commit/squash` with a JSON/YAML spec
+1. You run `jj-hunk split/commit/squash` with a hunkset expression or JSON/YAML spec
 2. jj-hunk writes the spec to a temp file and sets `JJ_HUNK_SELECTION` env var
 3. jj-hunk passes temporary `merge-tools.jj-hunk` config to jj when needed
 4. jj invokes `jj-hunk select $left $right` as the diff tool

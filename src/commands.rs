@@ -276,7 +276,7 @@ where
             Vec::new()
         };
 
-        enrich_hunks_with_semantics(&mut hunks, &path, &before_text);
+        enrich_hunks_with_semantics(&mut hunks, &path, &before_text, &after_text);
 
         if let SpecDecision::KeepSelection(selection) = &decision {
             hunks = filter_hunks(hunks, selection);
@@ -373,7 +373,12 @@ enum SpecDecision {
     KeepSelection(HunkSelection),
 }
 
-fn enrich_hunks_with_semantics(hunks: &mut [Hunk], path: &str, before_text: &str) {
+fn enrich_hunks_with_semantics(
+    hunks: &mut [Hunk],
+    path: &str,
+    before_text: &str,
+    after_text: &str,
+) {
     if hunks.is_empty() {
         return;
     }
@@ -383,9 +388,24 @@ fn enrich_hunks_with_semantics(hunks: &mut [Hunk], path: &str, before_text: &str
         return;
     }
 
-    // Collect the start lines we need context for (using before_range)
-    let lines: Vec<usize> = hunks.iter().map(|h| h.before_range.start).collect();
-    let contexts = semantic::contexts_for_lines(ext, before_text, &lines);
+    // For each hunk, pick the appropriate source text and line number.
+    // - For modified files with non-empty before_range, use before_text
+    //   (hunk references lines in the original file).
+    // - For added files or pure insertions (before_range.length == 0),
+    //   use after_text and after_range instead.
+    let use_after = before_text.is_empty();
+    let source = if use_after { after_text } else { before_text };
+    let lines: Vec<usize> = hunks
+        .iter()
+        .map(|h| {
+            if use_after || h.before_range.length == 0 {
+                h.after_range.start
+            } else {
+                h.before_range.start
+            }
+        })
+        .collect();
+    let contexts = semantic::contexts_for_lines(ext, source, &lines);
 
     for (hunk, ctx) in hunks.iter_mut().zip(contexts.into_iter()) {
         hunk.enclosing_function = ctx.enclosing_function;
@@ -444,7 +464,7 @@ fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
         let after_text = String::from_utf8_lossy(&after_bytes);
         let mut hunks = get_hunks(&before_text, &after_text);
 
-        enrich_hunks_with_semantics(&mut hunks, &path, &before_text);
+        enrich_hunks_with_semantics(&mut hunks, &path, &before_text, &after_text);
 
         if !hunks.is_empty() {
             file_hunks.push((path, entry.status.clone(), hunks));
@@ -470,7 +490,8 @@ fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
         })
         .collect();
 
-    let selected = hunkset::evaluate(&ast, &enriched);
+    let selected = hunkset::evaluate(&ast, &enriched)
+        .map_err(|e| anyhow::anyhow!("hunkset evaluation error: {}", e))?;
     let spec = hunkset::to_spec(&selected, &enriched);
 
     serde_json::to_string(&spec).context("failed to serialize hunkset result as spec")

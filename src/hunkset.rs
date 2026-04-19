@@ -1,6 +1,6 @@
 use crate::diff::Hunk;
 use regex::Regex;
-use crate::spec::{DefaultAction, FileSpec, HunkSelector, HunkSpec, Spec};
+use crate::spec::{DefaultAction, FileSpec, HunkSpec, Spec};
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
@@ -38,20 +38,43 @@ pub enum PatternKind {
     Regex,
 }
 
-impl StringPattern {
-    pub fn matches(&self, haystack: &str) -> bool {
+/// A pattern with a pre-compiled regex (if applicable).
+struct CompiledPattern {
+    kind: PatternKind,
+    value: String,
+    compiled_regex: Option<Regex>,
+}
+
+impl CompiledPattern {
+    fn compile(pattern: &StringPattern) -> Result<Self, String> {
+        let compiled_regex = if pattern.kind == PatternKind::Regex {
+            Some(Regex::new(&pattern.value).map_err(|e| {
+                format!("invalid regex '{}': {}", pattern.value, e)
+            })?)
+        } else {
+            None
+        };
+        Ok(Self {
+            kind: pattern.kind,
+            value: pattern.value.clone(),
+            compiled_regex,
+        })
+    }
+
+    fn matches(&self, haystack: &str) -> bool {
         match self.kind {
             PatternKind::Exact => haystack == self.value,
             PatternKind::Substring => haystack.contains(&self.value),
             PatternKind::Glob => glob_match(&self.value, haystack),
             PatternKind::Regex => {
-                match Regex::new(&self.value) {
-                    Ok(re) => re.is_match(haystack),
-                    Err(_) => false,
-                }
+                self.compiled_regex.as_ref().map_or(false, |re| re.is_match(haystack))
             }
         }
     }
+}
+
+fn compile_patterns(patterns: Vec<StringPattern>) -> Result<Vec<CompiledPattern>, String> {
+    patterns.iter().map(CompiledPattern::compile).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -510,82 +533,92 @@ pub struct EnrichedHunk<'a> {
 
 /// Evaluate a hunkset expression against a list of enriched hunks.
 /// Returns a set of indices into the input slice that match.
-pub fn evaluate(expr: &Expr, hunks: &[EnrichedHunk]) -> HashSet<usize> {
+pub fn evaluate(expr: &Expr, hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, String> {
     match expr {
-        Expr::All => (0..hunks.len()).collect(),
-        Expr::None => HashSet::new(),
+        Expr::All => Ok((0..hunks.len()).collect()),
+        Expr::None => Ok(HashSet::new()),
         Expr::Negation(inner) => {
-            let inner_set = evaluate(inner, hunks);
-            (0..hunks.len())
+            let inner_set = evaluate(inner, hunks)?;
+            Ok((0..hunks.len())
                 .filter(|i| !inner_set.contains(i))
-                .collect()
+                .collect())
         }
         Expr::Union(left, right) => {
-            let mut result = evaluate(left, hunks);
-            result.extend(evaluate(right, hunks));
-            result
+            let mut result = evaluate(left, hunks)?;
+            result.extend(evaluate(right, hunks)?);
+            Ok(result)
         }
         Expr::Intersection(left, right) => {
-            let left_set = evaluate(left, hunks);
-            let right_set = evaluate(right, hunks);
-            left_set.intersection(&right_set).copied().collect()
+            let left_set = evaluate(left, hunks)?;
+            let right_set = evaluate(right, hunks)?;
+            Ok(left_set.intersection(&right_set).copied().collect())
         }
         Expr::Difference(left, right) => {
-            let left_set = evaluate(left, hunks);
-            let right_set = evaluate(right, hunks);
-            left_set.difference(&right_set).copied().collect()
+            let left_set = evaluate(left, hunks)?;
+            let right_set = evaluate(right, hunks)?;
+            Ok(left_set.difference(&right_set).copied().collect())
         }
         Expr::Function(name, args) => evaluate_function(name, args, hunks),
     }
 }
 
-fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
+fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, String> {
+    // Pre-compile patterns (validates regex upfront)
+    let compiled = compile_patterns(extract_patterns(args))?;
+
     match name.as_ref() {
-        "file" => eval_file(args, hunks),
-        "glob" => eval_glob(args, hunks),
-        "extension" => eval_extension(args, hunks),
-        "status" => eval_status(args, hunks),
-        "type" => eval_type(args, hunks),
-        "lines" => eval_lines(args, hunks, LineRangeMode::Either),
-        "before_line" => eval_lines(args, hunks, LineRangeMode::Before),
-        "after_line" => eval_lines(args, hunks, LineRangeMode::After),
-        "content" => eval_content(args, hunks, ContentMode::Either),
-        "added" => eval_content(args, hunks, ContentMode::Added),
-        "removed" => eval_content(args, hunks, ContentMode::Removed),
-        "id" => eval_id(args, hunks),
-        "function" => eval_semantic(args, hunks, SemanticField::Function),
-        "scope" => eval_semantic(args, hunks, SemanticField::Scope),
-        "annotation" | "decorator" => eval_annotation(args, hunks),
-        "doc" => eval_doc(hunks),
-        "import" => eval_import(hunks),
-        "toplevel" => eval_toplevel(hunks),
-        "depth" => eval_depth(args, hunks),
-        _ => {
-            eprintln!("warning: unknown hunkset function '{}', returning empty set", name);
-            HashSet::new()
-        }
+        "file" => Ok(eval_file(args, &compiled, hunks)),
+        "glob" => Ok(eval_glob(args, hunks)),
+        "extension" => Ok(eval_extension(&compiled, hunks)),
+        "status" => Ok(eval_status(&compiled, hunks)),
+        "type" => Ok(eval_type(&compiled, hunks)),
+        "lines" => Ok(eval_lines(args, hunks, LineRangeMode::Either)),
+        "before_line" => Ok(eval_lines(args, hunks, LineRangeMode::Before)),
+        "after_line" => Ok(eval_lines(args, hunks, LineRangeMode::After)),
+        "content" => Ok(eval_content(&compiled, hunks, ContentMode::Either)),
+        "added" => Ok(eval_content(&compiled, hunks, ContentMode::Added)),
+        "removed" => Ok(eval_content(&compiled, hunks, ContentMode::Removed)),
+        "id" => Ok(eval_id(&compiled, hunks)),
+        "function" => Ok(eval_semantic(&compiled, hunks, SemanticField::Function)),
+        "scope" => Ok(eval_semantic(&compiled, hunks, SemanticField::Scope)),
+        "annotation" | "decorator" => Ok(eval_annotation(&compiled, hunks)),
+        "doc" => Ok(eval_doc(hunks)),
+        "import" => Ok(eval_import(hunks)),
+        "toplevel" => Ok(eval_toplevel(hunks)),
+        "depth" => Ok(eval_depth(args, hunks)),
+        _ => Err(format!("unknown hunkset function '{}'", name)),
     }
 }
 
-// --- file predicates ---
+// --- helpers ---
 
-fn eval_file(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let patterns = extract_patterns(args);
+fn filter_by_field<'a, F>(
+    patterns: &[CompiledPattern],
+    hunks: &[EnrichedHunk<'a>],
+    field: F,
+) -> HashSet<usize>
+where
+    F: Fn(&EnrichedHunk<'a>) -> &'a str,
+{
     hunks
         .iter()
         .enumerate()
-        .filter(|(_, h)| patterns.iter().any(|p| p.matches(h.file_path)))
+        .filter(|(_, h)| patterns.iter().any(|p| p.matches(field(h))))
         .map(|(i, _)| i)
         .collect()
 }
 
-fn eval_glob(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    // For glob(), force the pattern kind to Glob regardless of how it was specified
-    let patterns: Vec<StringPattern> = extract_patterns(args)
+// --- file predicates ---
+
+fn eval_file(args: &[Arg], _compiled: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    // Default to exact matching for file paths (not substring).
+    // We re-compile here to override the pattern kind.
+    let patterns: Vec<CompiledPattern> = extract_patterns(args)
         .into_iter()
-        .map(|p| StringPattern {
-            kind: PatternKind::Glob,
-            value: p.value,
+        .map(|p| {
+            let kind = if p.kind == PatternKind::Substring { PatternKind::Exact } else { p.kind };
+            // unwrap is safe: if it were a regex, it was already validated in evaluate_function
+            CompiledPattern::compile(&StringPattern { kind, value: p.value }).unwrap()
         })
         .collect();
     hunks
@@ -596,8 +629,21 @@ fn eval_glob(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
         .collect()
 }
 
-fn eval_extension(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let patterns = extract_patterns(args);
+fn eval_glob(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    // For glob(), force the pattern kind to Glob regardless of how it was specified
+    let patterns: Vec<CompiledPattern> = extract_patterns(args)
+        .into_iter()
+        .map(|p| CompiledPattern::compile(&StringPattern { kind: PatternKind::Glob, value: p.value }).unwrap())
+        .collect();
+    hunks
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| patterns.iter().any(|p| p.matches(h.file_path)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn eval_extension(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
     hunks
         .iter()
         .enumerate()
@@ -612,26 +658,14 @@ fn eval_extension(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
         .collect()
 }
 
-fn eval_status(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let patterns = extract_patterns(args);
-    hunks
-        .iter()
-        .enumerate()
-        .filter(|(_, h)| patterns.iter().any(|p| p.matches(h.file_status)))
-        .map(|(i, _)| i)
-        .collect()
+fn eval_status(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    filter_by_field(patterns, hunks, |h| h.file_status)
 }
 
 // --- hunk type ---
 
-fn eval_type(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let patterns = extract_patterns(args);
-    hunks
-        .iter()
-        .enumerate()
-        .filter(|(_, h)| patterns.iter().any(|p| p.matches(&h.hunk.hunk_type)))
-        .map(|(i, _)| i)
-        .collect()
+fn eval_type(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    filter_by_field(patterns, hunks, |h| &h.hunk.hunk_type)
 }
 
 // --- line ranges ---
@@ -695,8 +729,7 @@ enum ContentMode {
     Either,
 }
 
-fn eval_content(args: &[Arg], hunks: &[EnrichedHunk], mode: ContentMode) -> HashSet<usize> {
-    let patterns = extract_patterns(args);
+fn eval_content(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], mode: ContentMode) -> HashSet<usize> {
     hunks
         .iter()
         .enumerate()
@@ -713,8 +746,7 @@ fn eval_content(args: &[Arg], hunks: &[EnrichedHunk], mode: ContentMode) -> Hash
 
 // --- stable ID ---
 
-fn eval_id(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let patterns = extract_patterns(args);
+fn eval_id(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
     let ids: HashSet<String> = patterns
         .iter()
         .filter_map(|p| crate::diff::normalize_hunk_id(&p.value))
@@ -728,7 +760,7 @@ fn eval_id(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
         .collect()
 }
 
-// --- semantic (stub) ---
+// --- semantic ---
 
 #[derive(Clone, Copy)]
 enum SemanticField {
@@ -736,9 +768,7 @@ enum SemanticField {
     Scope,
 }
 
-fn eval_semantic(args: &[Arg], hunks: &[EnrichedHunk], field: SemanticField) -> HashSet<usize> {
-    let patterns = extract_patterns(args);
-
+fn eval_semantic(patterns: &[CompiledPattern], hunks: &[EnrichedHunk], field: SemanticField) -> HashSet<usize> {
     let result: HashSet<usize> = hunks
         .iter()
         .enumerate()
@@ -760,7 +790,6 @@ fn eval_semantic(args: &[Arg], hunks: &[EnrichedHunk], field: SemanticField) -> 
             SemanticField::Function => "function",
             SemanticField::Scope => "scope",
         };
-        // Only warn if semantic metadata is completely absent (not just non-matching)
         let has_any_metadata = hunks.iter().any(|h| match field {
             SemanticField::Function => h.enclosing_function.is_some(),
             SemanticField::Scope => h.enclosing_scope.is_some(),
@@ -779,14 +808,12 @@ fn eval_semantic(args: &[Arg], hunks: &[EnrichedHunk], field: SemanticField) -> 
 
 // --- annotation/decorator ---
 
-fn eval_annotation(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    let patterns = extract_patterns(args);
+fn eval_annotation(patterns: &[CompiledPattern], hunks: &[EnrichedHunk]) -> HashSet<usize> {
     hunks
         .iter()
         .enumerate()
         .filter(|(_, h)| {
             if patterns.is_empty() {
-                // No args: match any hunk that has annotations
                 !h.annotations.is_empty()
             } else {
                 h.annotations.iter().any(|ann| {
@@ -834,19 +861,18 @@ fn eval_toplevel(hunks: &[EnrichedHunk]) -> HashSet<usize> {
 // --- depth ---
 
 fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
-    // Accept a single number or range
-    let mut target_depths: HashSet<usize> = HashSet::new();
+    // Collect exact values and ranges, check via min/max bounds
+    let mut exact: Vec<usize> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     for arg in args {
         match arg {
             Arg::Pattern(p) => {
                 if let Ok(n) = p.value.parse::<usize>() {
-                    target_depths.insert(n);
+                    exact.push(n);
                 }
             }
             Arg::Range(start, end) => {
-                for d in *start..=*end {
-                    target_depths.insert(d);
-                }
+                ranges.push((*start, *end));
             }
         }
     }
@@ -854,7 +880,10 @@ fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
     hunks
         .iter()
         .enumerate()
-        .filter(|(_, h)| target_depths.contains(&h.nesting_depth))
+        .filter(|(_, h)| {
+            let d = h.nesting_depth;
+            exact.contains(&d) || ranges.iter().any(|&(lo, hi)| d >= lo && d <= hi)
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -899,10 +928,9 @@ pub fn to_spec(selected: &HashSet<usize>, hunks: &[EnrichedHunk]) -> Spec {
     let spec_files: HashMap<String, FileSpec> = files
         .into_iter()
         .map(|(path, ids)| {
-            let selectors = ids.into_iter().map(HunkSelector::Id).collect();
             let hunk_spec = HunkSpec {
-                hunks: selectors,
-                ids: Vec::new(),
+                hunks: Vec::new(),
+                ids,
             };
             (path, FileSpec::Selection(hunk_spec))
         })
@@ -1240,11 +1268,11 @@ mod tests {
             .collect();
 
         let expr = parse("type(insert)").unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([0]));
 
         let expr = parse("type(insert) | type(delete)").unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([0, 1]));
     }
 
@@ -1280,7 +1308,7 @@ mod tests {
         ];
 
         let expr = parse(r#"file("src/lib.rs")"#).unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([0]));
     }
 
@@ -1316,7 +1344,7 @@ mod tests {
         ];
 
         let expr = parse(r#"glob("src/**/*.rs")"#).unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([0]));
     }
 
@@ -1352,11 +1380,11 @@ mod tests {
         ];
 
         let expr = parse(r#"added("TODO")"#).unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([0]));
 
         let expr = parse(r#"removed("old")"#).unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([1]));
     }
 
@@ -1406,12 +1434,12 @@ mod tests {
 
         // insertions in src/
         let expr = parse(r#"type(insert) & glob("src/**")"#).unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([0, 1]));
 
         // everything except deletions
         let expr = parse("all() ~ type(delete)").unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([0, 1]));
     }
 
@@ -1451,11 +1479,11 @@ mod tests {
         ];
 
         let expr = parse("lines(1..10)").unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([0]));
 
         let expr = parse("lines(20..30)").unwrap();
-        let result = evaluate(&expr, &enriched);
+        let result = evaluate(&expr, &enriched).unwrap();
         assert_eq!(result, HashSet::from([1]));
     }
 
