@@ -342,35 +342,44 @@ fn enrich_hunks_with_semantics(
         return;
     }
 
-    // For each hunk, pick the appropriate source text and line number.
-    // - For modified files with non-empty before_range, use before_text
-    //   (hunk references lines in the original file).
-    // - For added files or pure insertions (before_range.length == 0),
-    //   use after_text and after_range instead.
-    let use_after = before_text.is_empty();
-    let source = if use_after { after_text } else { before_text };
-    let lines: Vec<usize> = hunks
-        .iter()
-        .map(|h| {
-            if use_after || h.before_range.length == 0 {
-                h.after_range.start
-            } else {
-                h.before_range.start
-            }
-        })
-        .collect();
-    let contexts = semantic::contexts_for_lines(ext, source, &lines);
+    // Parse both source texts lazily. For each hunk, we pick the appropriate
+    // parsed tree and line number:
+    // - Hunks with before_range.length > 0 reference lines in the original file.
+    // - Pure insertions (before_range.length == 0) or added files reference
+    //   lines in the after file.
+    let before_parsed = if !before_text.is_empty() {
+        semantic::ParsedFile::parse(ext, before_text)
+    } else {
+        None
+    };
+    let after_parsed = if !after_text.is_empty() {
+        semantic::ParsedFile::parse(ext, after_text)
+    } else {
+        None
+    };
 
-    for (hunk, ctx) in hunks.iter_mut().zip(contexts.into_iter()) {
-        hunk.semantic = crate::diff::SemanticInfo {
-            enclosing_function: ctx.enclosing_function,
-            enclosing_scope: ctx.enclosing_scope,
-            annotations: ctx.annotations,
-            is_doc_comment: ctx.is_doc_comment,
-            is_import: ctx.is_import,
-            is_toplevel: ctx.is_toplevel,
-            nesting_depth: ctx.nesting_depth,
+    for hunk in hunks.iter_mut() {
+        let ctx = if hunk.before_range.length > 0 {
+            before_parsed
+                .as_ref()
+                .map(|p| p.context_at_line(hunk.before_range.start))
+        } else {
+            after_parsed
+                .as_ref()
+                .map(|p| p.context_at_line(hunk.after_range.start))
         };
+
+        if let Some(ctx) = ctx {
+            hunk.semantic = crate::diff::SemanticInfo {
+                enclosing_function: ctx.enclosing_function,
+                enclosing_scope: ctx.enclosing_scope,
+                annotations: ctx.annotations,
+                is_doc_comment: ctx.is_doc_comment,
+                is_import: ctx.is_import,
+                is_toplevel: ctx.is_toplevel,
+                nesting_depth: ctx.nesting_depth,
+            };
+        }
     }
 }
 
