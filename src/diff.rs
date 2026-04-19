@@ -36,6 +36,10 @@ pub struct Hunk {
     pub after_range: LineRange,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<HunkContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,6 +171,8 @@ fn finalize_hunk(
         before_range,
         after_range,
         context,
+        enclosing_function: None,
+        enclosing_scope: None,
     });
 }
 

@@ -1,5 +1,6 @@
 use crate::diff::{apply_selected_hunks, get_hunks, Hunk, HunkSelection};
 use crate::hunkset::{self, EnrichedHunk};
+use crate::semantic;
 use crate::spec::{Action, DefaultAction, FileSpec, Spec};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
@@ -275,6 +276,8 @@ where
             Vec::new()
         };
 
+        enrich_hunks_with_semantics(&mut hunks, &path, &before_text);
+
         if let SpecDecision::KeepSelection(selection) = &decision {
             hunks = filter_hunks(hunks, selection);
         }
@@ -370,6 +373,26 @@ enum SpecDecision {
     KeepSelection(HunkSelection),
 }
 
+fn enrich_hunks_with_semantics(hunks: &mut [Hunk], path: &str, before_text: &str) {
+    if hunks.is_empty() {
+        return;
+    }
+
+    let ext = semantic::extension_from_path(path);
+    if ext.is_empty() {
+        return;
+    }
+
+    // Collect the start lines we need context for (using before_range)
+    let lines: Vec<usize> = hunks.iter().map(|h| h.before_range.start).collect();
+    let contexts = semantic::contexts_for_lines(ext, before_text, &lines);
+
+    for (hunk, ctx) in hunks.iter_mut().zip(contexts.into_iter()) {
+        hunk.enclosing_function = ctx.enclosing_function;
+        hunk.enclosing_scope = ctx.enclosing_scope;
+    }
+}
+
 fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<Option<String>> {
     if spec.is_none() && spec_file.is_none() {
         return Ok(None);
@@ -414,7 +437,9 @@ fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
 
         let before_text = String::from_utf8_lossy(&before_bytes);
         let after_text = String::from_utf8_lossy(&after_bytes);
-        let hunks = get_hunks(&before_text, &after_text);
+        let mut hunks = get_hunks(&before_text, &after_text);
+
+        enrich_hunks_with_semantics(&mut hunks, &path, &before_text);
 
         if !hunks.is_empty() {
             file_hunks.push((path, entry.status.clone(), hunks));
@@ -429,8 +454,8 @@ fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
                 file_path: path,
                 file_status: status,
                 hunk,
-                enclosing_function: None,
-                enclosing_scope: None,
+                enclosing_function: hunk.enclosing_function.as_deref(),
+                enclosing_scope: hunk.enclosing_scope.as_deref(),
             })
         })
         .collect();
@@ -941,7 +966,7 @@ fn format_files_text(lines: &mut Vec<String>, files: &[FileEntry]) {
     for file in files {
         lines.push(format_file_header(file));
         for hunk in &file.hunks {
-            lines.push(format!(
+            let mut hunk_line = format!(
                 "  hunk {} {} {} (before {}+{} after {}+{})",
                 hunk.index,
                 hunk.hunk_type,
@@ -950,7 +975,17 @@ fn format_files_text(lines: &mut Vec<String>, files: &[FileEntry]) {
                 hunk.before_range.length,
                 hunk.after_range.start,
                 hunk.after_range.length,
-            ));
+            );
+            if let Some(scope) = &hunk.enclosing_scope {
+                if let Some(func) = &hunk.enclosing_function {
+                    hunk_line.push_str(&format!(" in {}::{}", scope, func));
+                } else {
+                    hunk_line.push_str(&format!(" in {}", scope));
+                }
+            } else if let Some(func) = &hunk.enclosing_function {
+                hunk_line.push_str(&format!(" in {}", func));
+            }
+            lines.push(hunk_line);
             if !hunk.removed.is_empty() {
                 for line in hunk.removed.lines() {
                     lines.push(format!("    - {}", line));

@@ -1073,6 +1073,8 @@ mod tests {
                 length: if added.is_empty() { 0 } else { added.lines().count() },
             },
             context: None,
+            enclosing_function: None,
+            enclosing_scope: None,
         }
     }
 

@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 
 mod diff;
 mod hunkset;
+mod semantic;
 mod spec;
 mod commands;
 
