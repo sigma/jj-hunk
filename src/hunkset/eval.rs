@@ -45,6 +45,17 @@ pub fn evaluate(expr: &Expr, hunks: &[EnrichedHunk]) -> Result<HashSet<usize>, H
     }
 }
 
+/// Check that the `semantic` feature is enabled. Returns an error if not.
+#[cfg(feature = "semantic")]
+fn require_semantic(_name: &str) -> Result<(), HunksetError> {
+    Ok(())
+}
+
+#[cfg(not(feature = "semantic"))]
+fn require_semantic(name: &str) -> Result<(), HunksetError> {
+    Err(HunksetError::SemanticFeatureRequired { name: name.to_string() })
+}
+
 /// Compile patterns, forcing exact match for enum-like values (type, status, extension).
 fn compile_exact(args: &[Arg]) -> Result<Vec<CompiledPattern>, HunksetError> {
     let patterns: Vec<StringPattern> = extract_patterns(args)
@@ -77,13 +88,13 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> Result
         "added" => Ok(eval_content(&compiled, hunks, ContentMode::Added)),
         "removed" => Ok(eval_content(&compiled, hunks, ContentMode::Removed)),
         "id" => Ok(eval_id(&compiled, hunks)),
-        "function" => Ok(eval_semantic(&compiled, hunks, SemanticField::Function)),
-        "scope" => Ok(eval_semantic(&compiled, hunks, SemanticField::Scope)),
-        "annotation" | "decorator" => Ok(eval_annotation(&compiled, hunks)),
-        "doc" => Ok(eval_doc(hunks)),
-        "import" => Ok(eval_import(hunks)),
-        "toplevel" => Ok(eval_toplevel(hunks)),
-        "depth" => Ok(eval_depth(args, hunks)),
+        "function" => { require_semantic(name)?; Ok(eval_semantic(&compiled, hunks, SemanticField::Function)) }
+        "scope" => { require_semantic(name)?; Ok(eval_semantic(&compiled, hunks, SemanticField::Scope)) }
+        "annotation" | "decorator" => { require_semantic(name)?; Ok(eval_annotation(&compiled, hunks)) }
+        "doc" => { require_semantic(name)?; Ok(eval_doc(hunks)) }
+        "import" => { require_semantic(name)?; Ok(eval_import(hunks)) }
+        "toplevel" => { require_semantic(name)?; Ok(eval_toplevel(hunks)) }
+        "depth" => { require_semantic(name)?; Ok(eval_depth(args, hunks)) }
         _ => Err(HunksetError::UnknownFunction { name: name.to_string() }),
     }
 }
@@ -506,6 +517,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "semantic"))]
+    fn semantic_functions_require_feature() {
+        let h = make_hunk(0, "insert", "", "x\n");
+        let enriched = vec![EnrichedHunk { file_path: "a.rs", file_status: "modified", hunk: &h }];
+        for func in &["scope(\"Foo\")", "function(\"bar\")", "doc()", "import()", "toplevel()", "depth(0)", "annotation(\"test\")"] {
+            let expr = parse(func).unwrap();
+            let err = evaluate(&expr, &enriched).unwrap_err();
+            assert!(matches!(err, HunksetError::SemanticFeatureRequired { .. }), "expected SemanticFeatureRequired for {}", func);
+        }
+    }
+
+    #[test]
     fn eval_on_empty_hunks() {
         let empty: Vec<EnrichedHunk> = vec![];
         assert!(evaluate(&parse("all()").unwrap(), &empty).unwrap().is_empty());
@@ -536,6 +559,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "semantic")]
     fn eval_doc_import_toplevel() {
         let mut h1 = make_hunk(0, "insert", "", "/// doc\n");
         h1.semantic.is_doc_comment = true;
@@ -554,6 +578,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "semantic")]
     fn eval_depth_filter() {
         let mut h1 = make_hunk(0, "insert", "", "x\n");
         h1.semantic.nesting_depth = 0;
@@ -571,6 +596,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "semantic")]
     fn eval_annotation_filter() {
         let mut h1 = make_hunk(0, "insert", "", "x\n");
         h1.semantic.annotations = vec!["#[test]".to_string()];

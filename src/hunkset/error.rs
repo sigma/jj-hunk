@@ -15,6 +15,9 @@ pub enum HunksetError {
         pattern: String,
         source: regex::Error,
     },
+    #[error("{name}() requires the 'semantic' feature (build with --features semantic)")]
+    #[allow(dead_code)] // only constructed when semantic feature is disabled
+    SemanticFeatureRequired { name: String },
 }
 
 impl HunksetError {
