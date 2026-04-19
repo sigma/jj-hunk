@@ -390,6 +390,11 @@ fn enrich_hunks_with_semantics(hunks: &mut [Hunk], path: &str, before_text: &str
     for (hunk, ctx) in hunks.iter_mut().zip(contexts.into_iter()) {
         hunk.enclosing_function = ctx.enclosing_function;
         hunk.enclosing_scope = ctx.enclosing_scope;
+        hunk.annotations = ctx.annotations;
+        hunk.is_doc_comment = ctx.is_doc_comment;
+        hunk.is_import = ctx.is_import;
+        hunk.is_toplevel = ctx.is_toplevel;
+        hunk.nesting_depth = ctx.nesting_depth;
     }
 }
 
@@ -456,6 +461,11 @@ fn evaluate_hunkset(hunkset_expr: &str, rev: Option<&str>) -> Result<String> {
                 hunk,
                 enclosing_function: hunk.enclosing_function.as_deref(),
                 enclosing_scope: hunk.enclosing_scope.as_deref(),
+                annotations: &hunk.annotations,
+                is_doc_comment: hunk.is_doc_comment,
+                is_import: hunk.is_import,
+                is_toplevel: hunk.is_toplevel,
+                nesting_depth: hunk.nesting_depth,
             })
         })
         .collect();

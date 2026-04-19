@@ -5,6 +5,10 @@ use std::collections::HashSet;
 use std::fmt::Write;
 
 pub const HUNK_ID_PREFIX: &str = "hunk-";
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
 const CONTEXT_LINES: usize = 3;
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +44,16 @@ pub struct Hunk {
     pub enclosing_function: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enclosing_scope: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_doc_comment: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_import: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_toplevel: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub nesting_depth: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -173,6 +187,11 @@ fn finalize_hunk(
         context,
         enclosing_function: None,
         enclosing_scope: None,
+        annotations: Vec::new(),
+        is_doc_comment: false,
+        is_import: false,
+        is_toplevel: false,
+        nesting_depth: 0,
     });
 }
 

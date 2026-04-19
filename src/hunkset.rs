@@ -1,4 +1,5 @@
 use crate::diff::Hunk;
+use regex::Regex;
 use crate::spec::{DefaultAction, FileSpec, HunkSelector, HunkSpec, Spec};
 use std::collections::{HashMap, HashSet};
 
@@ -44,11 +45,10 @@ impl StringPattern {
             PatternKind::Substring => haystack.contains(&self.value),
             PatternKind::Glob => glob_match(&self.value, haystack),
             PatternKind::Regex => {
-                // Simple regex matching — we avoid pulling in the regex crate by
-                // using a basic approach. For production use, consider adding `regex`.
-                // For now we do substring as a fallback if regex parsing isn't available.
-                // TODO: add `regex` crate dependency for proper regex support
-                haystack.contains(&self.value)
+                match Regex::new(&self.value) {
+                    Ok(re) => re.is_match(haystack),
+                    Err(_) => false,
+                }
             }
         }
     }
@@ -464,6 +464,11 @@ pub struct EnrichedHunk<'a> {
     pub hunk: &'a Hunk,
     pub enclosing_function: Option<&'a str>,
     pub enclosing_scope: Option<&'a str>,
+    pub annotations: &'a [String],
+    pub is_doc_comment: bool,
+    pub is_import: bool,
+    pub is_toplevel: bool,
+    pub nesting_depth: usize,
 }
 
 /// Evaluate a hunkset expression against a list of enriched hunks.
@@ -513,6 +518,11 @@ fn evaluate_function(name: &str, args: &[Arg], hunks: &[EnrichedHunk]) -> HashSe
         "id" => eval_id(args, hunks),
         "function" => eval_semantic(args, hunks, SemanticField::Function),
         "scope" => eval_semantic(args, hunks, SemanticField::Scope),
+        "annotation" | "decorator" => eval_annotation(args, hunks),
+        "doc" => eval_doc(hunks),
+        "import" => eval_import(hunks),
+        "toplevel" => eval_toplevel(hunks),
+        "depth" => eval_depth(args, hunks),
         _ => {
             eprintln!("warning: unknown hunkset function '{}', returning empty set", name);
             HashSet::new()
@@ -728,6 +738,88 @@ fn eval_semantic(args: &[Arg], hunks: &[EnrichedHunk], field: SemanticField) -> 
     }
 
     result
+}
+
+// --- annotation/decorator ---
+
+fn eval_annotation(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    let patterns = extract_patterns(args);
+    hunks
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| {
+            if patterns.is_empty() {
+                // No args: match any hunk that has annotations
+                !h.annotations.is_empty()
+            } else {
+                h.annotations.iter().any(|ann| {
+                    patterns.iter().any(|p| p.matches(ann))
+                })
+            }
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// --- doc comments ---
+
+fn eval_doc(hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    hunks
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.is_doc_comment)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// --- imports ---
+
+fn eval_import(hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    hunks
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.is_import)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// --- toplevel ---
+
+fn eval_toplevel(hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    hunks
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.is_toplevel)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// --- depth ---
+
+fn eval_depth(args: &[Arg], hunks: &[EnrichedHunk]) -> HashSet<usize> {
+    // Accept a single number or range
+    let mut target_depths: HashSet<usize> = HashSet::new();
+    for arg in args {
+        match arg {
+            Arg::Pattern(p) => {
+                if let Ok(n) = p.value.parse::<usize>() {
+                    target_depths.insert(n);
+                }
+            }
+            Arg::Range(start, end) => {
+                for d in *start..=*end {
+                    target_depths.insert(d);
+                }
+            }
+        }
+    }
+
+    hunks
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| target_depths.contains(&h.nesting_depth))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 // --- helpers ---
@@ -1075,6 +1167,11 @@ mod tests {
             context: None,
             enclosing_function: None,
             enclosing_scope: None,
+            annotations: Vec::new(),
+            is_doc_comment: false,
+            is_import: false,
+            is_toplevel: false,
+            nesting_depth: 0,
         }
     }
 
@@ -1093,6 +1190,11 @@ mod tests {
                 hunk: h,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             })
             .collect();
 
@@ -1116,6 +1218,11 @@ mod tests {
                 hunk: &h1,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "tests/test.rs",
@@ -1123,6 +1230,11 @@ mod tests {
                 hunk: &h2,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
         ];
 
@@ -1142,6 +1254,11 @@ mod tests {
                 hunk: &h1,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "tests/test.rs",
@@ -1149,6 +1266,11 @@ mod tests {
                 hunk: &h2,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
         ];
 
@@ -1168,6 +1290,11 @@ mod tests {
                 hunk: &h1,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "b.rs",
@@ -1175,6 +1302,11 @@ mod tests {
                 hunk: &h2,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
         ];
 
@@ -1199,6 +1331,11 @@ mod tests {
                 hunk: &h1,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "src/b.rs",
@@ -1206,6 +1343,11 @@ mod tests {
                 hunk: &h2,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "tests/c.rs",
@@ -1213,6 +1355,11 @@ mod tests {
                 hunk: &h3,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
         ];
 
@@ -1242,6 +1389,11 @@ mod tests {
                 hunk: &h1,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "a.rs",
@@ -1249,6 +1401,11 @@ mod tests {
                 hunk: &h2,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
         ];
 
@@ -1272,6 +1429,11 @@ mod tests {
                 hunk: &h1,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
             EnrichedHunk {
                 file_path: "src/b.rs",
@@ -1279,6 +1441,11 @@ mod tests {
                 hunk: &h2,
                 enclosing_function: None,
                 enclosing_scope: None,
+                annotations: &[],
+                is_doc_comment: false,
+                is_import: false,
+                is_toplevel: true,
+                nesting_depth: 0,
             },
         ];
 
