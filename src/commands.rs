@@ -23,6 +23,7 @@ pub enum ListFormat {
     Json,
     Yaml,
     Text,
+    Diff,
 }
 
 impl Default for ListFormat {
@@ -269,6 +270,9 @@ where
                 ListFormat::Text => {
                     print!("{}", render_text_output(&output));
                 }
+                ListFormat::Diff => {
+                    print!("{}", render_diff_output(&output));
+                }
             }
         }
         ListMode::Files => {
@@ -280,13 +284,13 @@ where
                 ListFormat::Yaml => {
                     println!("{}", serde_yaml::to_string(&summary)?);
                 }
-                ListFormat::Text => {
+                ListFormat::Text | ListFormat::Diff => {
                     print!("{}", render_text_summary_output(&summary));
                 }
             }
         }
         ListMode::SpecTemplate => {
-            if matches!(options.format, ListFormat::Text) {
+            if matches!(options.format, ListFormat::Text | ListFormat::Diff) {
                 anyhow::bail!("--spec-template does not support text output (use json or yaml)");
             }
             let template = build_spec_template(files);
@@ -297,7 +301,7 @@ where
                 ListFormat::Yaml => {
                     println!("{}", serde_yaml::to_string(&template)?);
                 }
-                ListFormat::Text => {}
+                ListFormat::Text | ListFormat::Diff => {}
             }
         }
     }
@@ -822,6 +826,66 @@ fn render_text_output(output: &ListOutput) -> String {
     let mut output = lines.join("\n");
     output.push('\n');
     output
+}
+
+fn render_diff_output(output: &ListOutput) -> String {
+    let mut result = String::new();
+
+    let files = if let Some(groups) = &output.groups {
+        groups.iter().flat_map(|g| g.files.iter()).collect::<Vec<_>>()
+    } else if let Some(files) = &output.files {
+        files.iter().collect()
+    } else {
+        return result;
+    };
+
+    for file in files {
+        let (a_path, b_path) = match file.status.as_str() {
+            "added" => ("/dev/null".to_string(), format!("b/{}", file.path)),
+            "removed" => (format!("a/{}", file.path), "/dev/null".to_string()),
+            _ => (format!("a/{}", file.path), format!("b/{}", file.path)),
+        };
+
+        result.push_str(&format!("--- {}\n+++ {}\n", a_path, b_path));
+
+        for hunk in &file.hunks {
+            // Build the hunk header: @@ -before +after @@ [scope::function]  [id]
+            let before = format!("-{},{}", hunk.before_range.start, hunk.before_range.length);
+            let after = format!("+{},{}", hunk.after_range.start, hunk.after_range.length);
+
+            let mut context = String::new();
+            if let Some(scope) = &hunk.semantic.enclosing_scope {
+                if let Some(func) = &hunk.semantic.enclosing_function {
+                    context = format!(" {}::{}", scope, func);
+                } else {
+                    context = format!(" {}", scope);
+                }
+            } else if let Some(func) = &hunk.semantic.enclosing_function {
+                context = format!(" {}", func);
+            }
+
+            // Truncate ID for readability (first 12 hex chars after "hunk-")
+            let short_id = if hunk.id.len() > 17 {
+                format!("{}...", &hunk.id[..17])
+            } else {
+                hunk.id.clone()
+            };
+
+            result.push_str(&format!(
+                "@@ {} {} @@{} [{}]\n",
+                before, after, context, short_id
+            ));
+
+            for line in hunk.removed.lines() {
+                result.push_str(&format!("-{}\n", line));
+            }
+            for line in hunk.added.lines() {
+                result.push_str(&format!("+{}\n", line));
+            }
+        }
+    }
+
+    result
 }
 
 fn render_text_summary_output(output: &ListSummaryOutput) -> String {

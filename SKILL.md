@@ -1,17 +1,18 @@
 ---
 name: jj-hunk
-description: Programmatic hunk selection for jj (Jujutsu). Use when splitting commits, making partial commits, or selectively squashing changes without interactive UI.
+description: Programmatic hunk selection for jj (Jujutsu). Use when splitting commits, making partial commits, selectively squashing changes, or coordinating concurrent agent work into clean history.
 ---
 
 # jj-hunk: Programmatic Hunk Selection
 
-Use `jj-hunk` for non-interactive hunk selection in jj. Essential for AI agents that need to create clean, logical commits from mixed changes.
+Use `jj-hunk` for non-interactive hunk selection in jj. Essential for AI agents that need to create clean, logical commits from mixed changes — especially when multiple agents work concurrently.
 
 ## When to Use This Skill
 
 - Splitting a commit into multiple logical commits
 - Committing only specific hunks (partial commit)
 - Squashing only certain changes into parent
+- Coordinating concurrent agent work into clean, independent branches
 - Any hunk selection that would normally require `jj split -i` or `jj squash -i`
 
 ## Setup
@@ -27,319 +28,259 @@ program = "jj-hunk"
 edit-args = ["select", "$left", "$right"]
 ```
 
-## Core Workflow
+## Hunkset Query Language
 
-### 1. List Hunks
+jj-hunk supports an algebraic query language (hunkset) for selecting hunks, inspired by jj's filesets and revsets. This is the recommended way to select hunks — it's more readable, composable, and semantically aware than JSON specs.
+
+### Operators
+
+| Operator | Meaning | Example |
+|----------|---------|---------|
+| `x \| y` | Union | `type(insert) \| type(delete)` |
+| `x & y` | Intersection | `type(insert) & glob("src/**")` |
+| `x ~ y` | Difference | `all() ~ type(delete)` |
+| `~x` | Negation | `~type(delete)` |
+| `(x)` | Grouping | `(type(insert) \| type(replace)) & file("x")` |
+
+### Functions
+
+**File predicates:**
+
+| Function | Description |
+|----------|-------------|
+| `file("path")` | Exact file path match |
+| `glob("src/**/*.rs")` | Glob pattern on file path |
+| `extension("rs")` | File extension |
+| `status(modified)` | File status (modified, added, removed, renamed, copied) |
+
+**Hunk type:**
+
+| Function | Description |
+|----------|-------------|
+| `type(insert)` | Insertions only |
+| `type(delete)` | Deletions only |
+| `type(replace)` | Replacements only |
+
+**Content matching:**
+
+| Function | Description |
+|----------|-------------|
+| `content("text")` | Added or removed text contains "text" |
+| `added("text")` | Added text contains "text" |
+| `removed("text")` | Removed text contains "text" |
+
+**Line ranges:**
+
+| Function | Description |
+|----------|-------------|
+| `lines(10..20)` | Hunks touching lines 10-20 |
+
+**Identity (stable across concurrent changes):**
+
+| Function | Description |
+|----------|-------------|
+| `id("hunk-7c3d...")` | Select by stable hunk ID (supports prefix matching) |
+| `all()` / `none()` | Everything / nothing |
+
+**Semantic (tree-sitter powered, requires `semantic` feature):**
+
+| Function | Description |
+|----------|-------------|
+| `function("name")` | Hunks inside a function/method |
+| `scope("ClassName")` | Hunks inside a class/struct/impl/module |
+| `annotation("test")` | Hunks in annotated/decorated functions |
+| `doc()` | Hunks that are doc comments |
+| `import()` | Hunks that are import/use/require statements |
+| `toplevel()` | Hunks not inside any function or scope |
+| `depth(0..1)` | Hunks at nesting depth 0 or 1 |
+
+**Pattern prefixes** (on string arguments):
+- Bare identifier: exact match — `type(insert)`
+- Quoted string: substring match — `added("TODO")`
+- `exact:"text"`, `substring:"text"`, `glob:"pattern"`, `regex:"pattern"`
+
+### Examples
 
 ```bash
-jj-hunk list
+# All insertions in Rust files
+jj-hunk split 'type(insert) & glob("src/**/*.rs")' "add new code"
 
-# List hunks for a specific revision (diff vs parent)
-# Note: revset must resolve to a single revision
-jj-hunk list --rev @
+# Everything inside UserService class
+jj-hunk split 'scope("UserService")' "refactor: update UserService"
 
-# Emit YAML instead of JSON
-jj-hunk list --format yaml
+# All test functions
+jj-hunk split 'annotation("test")' "test: add unit tests"
+
+# Imports only
+jj-hunk split 'import()' "chore: update imports"
+
+# Everything except docs
+jj-hunk split 'all() ~ doc()' "feat: implementation"
 ```
 
-Options:
-- `--rev <revset>` — diff the revision against its parent (revset must resolve to a single revision)
-- `--format json|yaml|text` — output format (default: json)
-- `--include <glob>` / `--exclude <glob>` — filter paths (repeatable)
-- `--group none|directory|extension|status` — group output
-- `--binary skip|mark|include` — binary handling (default: mark)
-- `--max-bytes <n>` / `--max-lines <n>` — truncate before diffing
-- `--spec <json|yaml>` / `--spec-file <path>` — preview using a spec filter
-- `--files` — list files with hunk counts only
-- `--spec-template` — emit a spec template (JSON/YAML only)
+## Output Formats
 
-Output (JSON):
-```json
-{
-  "files": [
-    {
-      "path": "src/foo.rs",
-      "status": "modified",
-      "hunks": [
-        {
-          "id": "hunk-7c3d...",
-          "index": 0,
-          "type": "replace",
-          "removed": "old\n",
-          "added": "new\n",
-          "before": {"start": 1, "lines": 1},
-          "after": {"start": 1, "lines": 1}
-        },
-        {
-          "id": "hunk-2f91...",
-          "index": 1,
-          "type": "insert",
-          "removed": "",
-          "added": "// added\n",
-          "before": {"start": 2, "lines": 0},
-          "after": {"start": 2, "lines": 1}
-        }
-      ]
-    },
-    {
-      "path": "src/bar.rs",
-      "status": "modified",
-      "hunks": [
-        {
-          "id": "hunk-aa12...",
-          "index": 0,
-          "type": "delete",
-          "removed": "removed\n",
-          "added": "",
-          "before": {"start": 3, "lines": 1},
-          "after": {"start": 3, "lines": 0}
-        }
-      ]
-    }
-  ]
-}
+```bash
+jj-hunk list --format json    # Structured data (default)
+jj-hunk list --format yaml    # YAML variant
+jj-hunk list --format text    # Human-readable summary with semantic context
+jj-hunk list --format diff    # Unified diff with hunk IDs and semantic context
 ```
 
-Each hunk includes a stable `id` (sha256) alongside the 0-based `index`.
+The `diff` format produces a unified patch annotated with hunk IDs and enclosing function/scope names:
 
-### 2. Build a Spec
+```diff
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -211,1 +211,2 @@ list [hunk-162b7798da21...]
+-        if !include.is_empty() && !matches_any(&include, &fh.path) {
++        let paths_to_check = fh.all_paths();
++        if !include.is_empty() && !paths_to_check.iter().any(|p| matches_any(&include, p)) {
+```
 
-Select hunks by index or `id` (emitted as `hunk-<sha256>`), or use file-level actions. Specs can be JSON or YAML:
+This format is useful when you need to apply changes outside a pure jj workflow (e.g., `git am`), or when you want to inspect or archive the exact patch before applying.
+
+## Core Workflow
+
+### 1. Explore hunks with hunkset queries
+
+```bash
+# See all hunks
+jj-hunk list --format text
+
+# Preview what a query would select
+jj-hunk list --spec 'scope("UserService")' --format text
+
+# Verify a selection covers everything you expect
+jj-hunk list --spec 'scope("UserService") ~ id("hunk-7c3d...")' --format text
+# Empty output = the id covers everything in that scope
+```
+
+### 2. Select and split
+
+Use hunkset expressions directly with split/commit/squash:
+
+```bash
+# Split by semantic scope
+jj-hunk split 'scope("UserService") & ~import()' "refactor: update UserService"
+
+# Split by file pattern
+jj-hunk split 'glob("src/api/**")' "feat: add API endpoints"
+
+# Split by content
+jj-hunk split 'added("TODO") | added("FIXME")' "chore: add TODOs"
+```
+
+### 3. Use stable IDs for safety
+
+When other changes may arrive concurrently, **always resolve your hunkset query to stable IDs before executing the split**. This protects against new hunks appearing between the query and the split:
+
+```bash
+# Step 1: Query to find the hunks you want
+jj-hunk list --spec 'function("handle_request") & glob("src/api/**")' --format json
+
+# Step 2: Note the hunk IDs from the output, then split using IDs
+jj-hunk split 'id("hunk-7c3d...", "hunk-9a2b...", "hunk-ff01...")' "feat: handle_request implementation"
+```
+
+Hunk IDs are stable SHA256 hashes of the hunk content — they won't change even if other hunks are added to the same file by concurrent work.
+
+### 4. JSON specs (alternative)
+
+For complex selections or when building specs programmatically:
 
 ```json
 {
   "files": {
-    "src/foo.rs": {"hunks": [0, "hunk-7c3d..."]},
-    "src/bar.rs": {"ids": ["hunk-aa12..."]},
-    "src/baz.rs": {"action": "keep"},
+    "src/foo.rs": {"ids": ["hunk-7c3d...", "hunk-2f91..."]},
+    "src/bar.rs": {"action": "keep"},
     "src/qux.rs": {"action": "reset"}
   },
   "default": "reset"
 }
 ```
 
-| Spec | Effect |
-|------|--------|
-| `{"hunks": [0, 2]}` | Include only hunks 0 and 2 |
-| `{"hunks": ["hunk-..."]}` | Include hunks by id string |
-| `{"ids": ["hunk-..."]}` | Include hunks by stable id |
-| `{"action": "keep"}` | Include all changes |
-| `{"action": "reset"}` | Discard all changes |
-| `"default": "reset"` | Unlisted files are discarded |
-| `"default": "keep"` | Unlisted files are kept |
+Hunkset expressions and JSON specs are auto-detected — use whichever is clearer for the situation.
 
-`ids` and `hunks` are merged if both are provided.
+## Multi-Agent Concurrent Workflow
 
-### 3. Execute
+When multiple agents work in parallel on different tasks, their changes tend to intermingle in the working copy. jj-hunk enables each agent to retrospectively extract its own changes into clean, independent branches.
 
-Specs can be provided inline, read from stdin with `-`, or loaded via `--spec-file` (omit `<spec>` when using `--spec-file`).
+### Setup: Create the merge structure
+
+Before agents start working, establish the topology:
 
 ```bash
-# Split: selected hunks → first commit, rest → second commit
-jj-hunk split '<spec>' "commit message"
-
-# Read spec from a file (JSON or YAML)
-jj-hunk split --spec-file spec.yaml "commit message"
-
-# Commit: selected hunks committed, rest stays in working copy
-jj-hunk commit '<spec>' "commit message"
-
-# Read spec from stdin
-cat spec.json | jj-hunk commit - "commit message"
-
-# Squash: selected hunks squashed into parent
-jj-hunk squash '<spec>'
+# Create the merge point that will combine all agent work
+jj new main -m "merge: combine agent work"
+# Save its change ID
+MERGE=$(jj log -r @ --template 'change_id' --no-graph)
 ```
 
-## Examples
+### Each agent's workflow
 
-### Split Mixed Changes into Logical Commits
-
-You have refactoring and a new feature mixed together:
+Each agent works at the head (or a descendant of the merge), then cleans up:
 
 ```bash
-# 1. See what hunks exist
-jj-hunk list
+# 1. Make changes normally (code, tests, etc.)
+#    Changes land in the working copy alongside other agents' work.
 
-# 2. Split out the refactoring first
-jj-hunk split '{"files": {"src/lib.rs": {"hunks": [0, 1]}}, "default": "reset"}' \
-  "refactor: extract helper function"
+# 2. Query to identify YOUR changes using semantic context
+jj-hunk list --spec 'scope("UserService") & glob("src/api/**")' --format text
 
-# 3. Remaining changes become second commit
-jj describe -m "feat: add new feature"
+# 3. Verify the query captures exactly your work — refine if needed
+#    Combine predicates for precision:
+jj-hunk list --spec 'function("handle_request") & file("src/api/handler.rs")' --format text
+
+# 4. Resolve to stable IDs (protects against concurrent changes)
+#    Collect the hunk IDs from the output above.
+
+# 5. Split your changes into a clean commit
+jj-hunk split 'id("hunk-7c3d...", "hunk-9a2b...")' "feat: add request handler"
+
+# 6. Rebase the clean commit to its proper place in the graph
+jj rebase -r <new_change> -d main
+
+# 7. Update the merge to include your branch
+jj rebase -r $MERGE -d <new_change> -d <other_branches...>
 ```
 
-### Commit Only Part of Your Changes
+### Verification
 
-Keep experimental code in working copy while committing the fix:
+After each agent finishes, verify the merge is clean:
 
 ```bash
-jj-hunk commit '{"files": {"src/bug.rs": {"action": "keep"}}, "default": "reset"}' \
-  "fix: handle null case"
+jj diff -r $MERGE
+# Should be empty (or contain only conflict resolutions)
 ```
 
-### Squash Specific Files into Parent
+If the merge has unexpected content, an agent's split was incomplete — use `jj-hunk list -r $MERGE` to see what's left and dispatch it.
 
-```bash
-jj-hunk squash '{"files": {"src/tests.rs": {"action": "keep"}}, "default": "reset"}'
+### Example: Three agents working concurrently
+
+```
+main
+├── agent-1: feat: add database schema
+│   (created by: jj-hunk split 'glob("src/db/**")' ...)
+├── agent-2: feat: add API endpoints  
+│   (created by: jj-hunk split 'scope("Router") & glob("src/api/**")' ...)
+├── agent-3: refactor: update shared utils
+│   (created by: jj-hunk split 'function("parse_config") | function("validate")' ...)
+└── merge: combine agent work (should be empty)
 ```
 
-### Keep Everything Except One File
+### Key principles
 
-```bash
-jj-hunk split '{"files": {"src/wip.rs": {"action": "reset"}}, "default": "keep"}' \
-  "feat: complete implementation"
-```
-
-## Direct jj --tool Usage
-
-The commands above are wrappers. For direct control:
-
-```bash
-# Write spec to file
-echo '{"files": {"src/foo.rs": {"hunks": [0]}}, "default": "reset"}' > /tmp/spec.json
-
-# Run jj with the tool
-JJ_HUNK_SELECTION=/tmp/spec.json jj split -i --tool=jj-hunk -m "message"
-```
-
-## Hunk Types
-
-| Type | Meaning |
-|------|---------|
-| `insert` | New lines added |
-| `delete` | Lines removed |
-| `replace` | Lines changed (removed + added) |
-
-## Agent Workflow Examples
-
-### Understanding the Output
-
-Always start by inspecting what hunks exist:
-
-```bash
-jj-hunk list
-```
-
-Example output:
-```json
-{
-  "files": [
-    {
-      "path": "src/db/schema.ts",
-      "status": "modified",
-      "hunks": [
-        {"id": "hunk-98af...", "index": 0, "type": "insert", "removed": "", "added": "import { pgTable }...\n", "before": {"start": 1, "lines": 0}, "after": {"start": 1, "lines": 1}},
-        {"id": "hunk-21b3...", "index": 1, "type": "insert", "removed": "", "added": "export const users = pgTable...\n", "before": {"start": 2, "lines": 0}, "after": {"start": 2, "lines": 1}}
-      ]
-    },
-    {
-      "path": "src/api/routes.ts",
-      "status": "modified",
-      "hunks": [
-        {"id": "hunk-cc19...", "index": 0, "type": "replace", "removed": "// TODO\n", "added": "app.get('/users', ...);\n", "before": {"start": 10, "lines": 1}, "after": {"start": 10, "lines": 1}},
-        {"id": "hunk-4b20...", "index": 1, "type": "insert", "removed": "", "added": "app.get('/posts', ...);\n", "before": {"start": 11, "lines": 0}, "after": {"start": 11, "lines": 1}}
-      ]
-    },
-    {
-      "path": "src/lib/utils.ts",
-      "status": "modified",
-      "hunks": [
-        {"id": "hunk-11bf...", "index": 0, "type": "replace", "removed": "function old()...\n", "added": "function new()...\n", "before": {"start": 5, "lines": 1}, "after": {"start": 5, "lines": 1}},
-        {"id": "hunk-ee43...", "index": 1, "type": "insert", "removed": "", "added": "export function helper()...\n", "before": {"start": 6, "lines": 0}, "after": {"start": 6, "lines": 1}},
-        {"id": "hunk-09ad...", "index": 2, "type": "delete", "removed": "// dead code\n", "added": "", "before": {"start": 20, "lines": 1}, "after": {"start": 20, "lines": 0}}
-      ]
-    }
-  ]
-}
-```
-
-### File-Level Selection
-
-When all hunks in a file belong to the same logical change:
-
-```bash
-# Keep entire file, reset everything else
-jj-hunk split '{"files": {"src/db/schema.ts": {"action": "keep"}}, "default": "reset"}' "feat: add database schema"
-```
-
-### Hunk-Level Selection
-
-When a single file has mixed concerns (most powerful feature):
-
-```bash
-# src/lib/utils.ts has:
-#   - hunks 0, 2: refactoring (rename + delete dead code)
-#   - hunk 1: new feature (helper function)
-
-# Extract just the refactoring
-jj-hunk split '{"files": {"src/lib/utils.ts": {"hunks": [0, 2]}}, "default": "reset"}' "refactor: clean up utils"
-
-# Hunk 1 remains in working copy for the next commit
-jj describe -m "feat: add helper function"
-```
-
-### Mixed Selection
-
-Combine file-level and hunk-level in one spec:
-
-```bash
-# Keep all of schema.ts + only hunk 0 from routes.ts
-jj-hunk split '{"files": {"src/db/schema.ts": {"action": "keep"}, "src/api/routes.ts": {"hunks": [0]}}, "default": "reset"}' "feat: add users table and endpoint"
-
-# Next: remaining routes.ts hunk
-jj-hunk split '{"files": {"src/api/routes.ts": {"action": "keep"}}, "default": "reset"}' "feat: add posts endpoint"
-
-# Final: utils changes
-jj describe -m "refactor: utils cleanup"
-```
-
-### Complete Workflow Example
-
-Starting with a messy commit containing schema, API, and refactoring changes:
-
-```bash
-# 1. Edit the commit
-jj edit <revision>
-
-# 2. Inspect all hunks
-jj-hunk list
-
-# 3. Split in narrative order
-
-# Infrastructure first
-jj-hunk split '{"files": {"src/db/schema.ts": {"action": "keep"}}, "default": "reset"}' "feat: add database schema"
-
-# Refactoring second (specific hunks from utils.ts)
-jj-hunk split '{"files": {"src/lib/utils.ts": {"hunks": [0, 2]}}, "default": "reset"}' "refactor: clean up utils"
-
-# Feature using the refactored code
-jj-hunk split '{"files": {"src/lib/utils.ts": {"action": "keep"}, "src/api/routes.ts": {"hunks": [0]}}, "default": "reset"}' "feat: add users endpoint"
-
-# Remaining changes
-jj describe -m "feat: add posts endpoint"
-
-# 4. Verify
-jj log -r 'trunk()..@'
-```
-
-### Verifying Splits
-
-After splitting, verify each commit has the right content:
-
-```bash
-# Check stats for each commit
-jj diff -r <rev1> --stat
-jj diff -r <rev2> --stat
-
-# Or view the log
-jj log
-```
+- **Query first, split by ID**: Use hunkset queries to explore, but resolve to stable hunk IDs before executing the split. IDs are content-addressed (SHA256) and immune to concurrent modifications.
+- **Combine predicates for precision**: Use `&` to intersect scope and file queries — `scope("MyClass") & file("src/models.rs")` is safer than either alone, because it won't accidentally capture unrelated changes that happen to be in the same file or an identically-named scope in a different file.
+- **Verify the merge**: After splitting, the merge change should be empty. If it's not, something was missed — use `jj-hunk list -r $MERGE` to find and dispatch remaining hunks.
+- **Rebase, don't move**: After `jj-hunk split` creates a new change, use `jj rebase` to position it in the graph. The split creates the change as a child of the current revision; rebasing moves it to its logical location.
 
 ## Tips
 
-- **Always list first**: Run `jj-hunk list` to see hunk indices/ids before building specs
-- **Prefer ids for stability**: Use `ids` when hunks might shift between list and apply
-- **Use default wisely**: `"default": "reset"` is safer (explicit inclusion), `"default": "keep"` is convenient for excluding specific files
-- **Combine with jj**: After splitting, use `jj describe` to refine commit messages
-- **Exact paths required**: File paths must match exactly (e.g., `"src/lib.rs"` not `"src/"`)
+- **Prefer hunkset over JSON**: Hunkset expressions are more readable and composable. Reserve JSON specs for programmatic generation.
+- **Use `--format text` for exploration**: Shows semantic context (enclosing function/scope) inline, making it easy to identify which hunks belong to which logical change.
+- **Use `--format diff` for export**: Produces a unified patch with hunk IDs that can be applied via `git am` or archived for review.
+- **Prefer IDs for stability**: Hunk IDs (SHA256) are immune to concurrent changes. Always resolve queries to IDs before executing splits in concurrent workflows.
+- **Use `--spec` on `list` to verify**: Preview what a split would select before executing it. An empty result means your query matches nothing; refine it.
+- **`"default": "reset"` is safer**: Explicitly include what you want rather than excluding what you don't.
